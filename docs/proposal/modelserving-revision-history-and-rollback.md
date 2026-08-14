@@ -47,6 +47,7 @@ These behaviors prevent reliable recovery of an earlier desired workload.
 - A separate rollback state machine.
 - Rollback of an individual Role.
 - Guaranteed CLI rollback to legacy revisions.
+- Zero-disruption migration from the legacy revision data format.
 
 ### Proposal
 
@@ -93,6 +94,14 @@ entries added after that revision. The serialized patch is used unchanged as
 `ControllerRevision.Data` is never modified after creation. The revision hash
 continues to identify workload content and is used in the ControllerRevision
 name, ModelServing status, and workload labels.
+
+The v1 revision data format is a compatibility contract. A new optional field
+whose unset value preserves existing workload behavior must remain omitted from
+revision data, so adding the field alone does not change existing revisions. A
+new default that changes the rendered workload is revisioned normally. A future
+format or normalization change that changes serialized data may create a new
+revision and trigger a rollout, and must be documented as an explicit
+migration.
 
 #### Applying a Revision
 
@@ -168,6 +177,11 @@ newest until at most `revisionHistoryLimit` remain.
 
 Live revision discovery must use persisted workload state, including Pod
 revision labels, rather than relying only on the controller's in-memory store.
+GC must not run while workload deletion or recovery is in progress. If a
+partition-protected workload can temporarily have no Pod, the controller must
+persist its exact revision assignment before deletion and treat that assignment
+as live until the replacement is created. This prevents GC, including with a
+limit of zero, from removing a revision during the deletion window.
 
 #### Compatibility
 
@@ -176,10 +190,13 @@ New revisions will carry the annotation
 distinguished from the legacy wrapped Role list.
 
 - Legacy revisions remain readable for active rollout and recovery.
-- After upgrade, the controller records the current desired workload in the
-  new format without changing the revision hash used by existing workloads.
-  The legacy hash remains active until the next revisioned spec change, which
-  prevents a controller upgrade from triggering a rollout.
+- The first reconciliation with the v1 format builds revision data and a hash
+  through the normal revision lifecycle. Because this identity differs from a
+  legacy revision, upgrading the controller initiates a one-time rollout of an
+  otherwise unchanged ModelServing.
+- The migration does not persist a compatibility baseline or maintain an alias
+  between legacy and v1 revisions. The one-time rollout follows the configured
+  rollout strategy, `maxUnavailable`, and `partition`.
 - CLI history and rollback only guarantee revisions in the new format.
 - Legacy revision Data is not rewritten or renumbered and is removed through
   normal history retention once it is no longer live.
@@ -203,3 +220,10 @@ an equivalent revision also preserves the existing `<name>-<hash>` identity.
 Adding a rollback request to the API would require separate rollback state and
 completion handling. Updating the desired spec through the CLI keeps rollback
 declarative and reuses the existing rollout implementation.
+
+#### Zero-rollout legacy migration
+
+Keeping the legacy revision active while recording equivalent v1 data would
+require a persistent compatibility baseline or alias and special reconciliation
+and GC rules. This was rejected in favor of a one-time rollout through the
+normal revision lifecycle.
