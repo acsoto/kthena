@@ -65,6 +65,10 @@ The CLI applies the selected revision to `ModelServing.spec`. The controller
 then handles the change as a normal `ServingGroupRollingUpdate` or
 `RoleRollingUpdate`.
 
+Both rollout strategies must treat a change to any revisioned field applicable
+to a workload as an update. The mechanism used to detect outdated workloads is
+an implementation detail of each strategy.
+
 The CLI retries conflicts by reading the latest ModelServing and reapplying the
 revision, so concurrent changes to operational fields are not overwritten.
 
@@ -126,10 +130,11 @@ an operational `gangPolicy` can prevent removal of a Role referenced by
 `minRoleReplicas`; the CLI rejects such a rollback without changing the
 ModelServing.
 
-Partition-protected workloads also use this rule: their template comes from
-the historical revision, while their Role replicas come from the current spec.
-This replaces the current behavior that restores Role replicas from revision
-data.
+When a workload is created or recovered for revision R, all revisioned fields,
+including `schedulerName`, `plugins`, and Role templates, come from R, while
+operational fields come from the current ModelServing. This also applies to
+partition-protected recovery. Role replicas therefore come from the current
+spec, replacing the current behavior that restores them from revision data.
 
 #### Revision Lifecycle
 
