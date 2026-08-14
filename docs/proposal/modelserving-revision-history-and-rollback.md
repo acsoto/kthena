@@ -47,7 +47,6 @@ These behaviors prevent reliable recovery of an earlier desired workload.
 - A separate rollback state machine.
 - Rollback of an individual Role.
 - Guaranteed CLI rollback to legacy revisions.
-- Zero-disruption migration from the legacy revision data format.
 
 ### Proposal
 
@@ -94,14 +93,6 @@ entries added after that revision. The serialized patch is used unchanged as
 `ControllerRevision.Data` is never modified after creation. The revision hash
 continues to identify workload content and is used in the ControllerRevision
 name, ModelServing status, and workload labels.
-
-The v1 revision data format is a compatibility contract. A new optional field
-whose unset value preserves existing workload behavior must remain omitted from
-revision data, so adding the field alone does not change existing revisions. A
-new default that changes the rendered workload is revisioned normally. A future
-format or normalization change that changes serialized data may create a new
-revision and trigger a rollout, and must be documented as an explicit
-migration.
 
 #### Applying a Revision
 
@@ -175,13 +166,10 @@ The limit applies to non-live history. Revisions referenced by
 do not count toward the limit. Non-live revisions are deleted from oldest to
 newest until at most `revisionHistoryLimit` remain.
 
-Live revision discovery must use persisted workload state, including Pod
-revision labels, rather than relying only on the controller's in-memory store.
-GC must not run while workload deletion or recovery is in progress. If a
-partition-protected workload can temporarily have no Pod, the controller must
-persist its exact revision assignment before deletion and treat that assignment
-as live until the replacement is created. This prevents GC, including with a
-limit of zero, from removing a revision during the deletion window.
+Revision references required for partition-protected recovery must survive Pod
+deletion and controller restart, and remain live until the replacement is
+created. GC therefore cannot rely only on existing Pod labels or the
+controller's in-memory store.
 
 #### Compatibility
 
