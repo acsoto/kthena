@@ -73,22 +73,37 @@ revision, so concurrent changes to operational fields are not overwritten.
 #### Revision Data
 
 `ControllerRevision.Data` will contain a deterministic strategic merge patch
-with only workload-defining fields. API defaults and nil/empty values are
-normalized before serialization; Role and plugin order is preserved because it
-is semantically significant.
+with only explicitly selected workload-defining fields. `BuildRevisionData`
+constructs this projection from an allowlist; it must not copy the API object
+and remove known operational fields. API defaults and nil/empty values are
+normalized before serialization.
 
 | Revisioned fields | Operational fields |
 | --- | --- |
 | `schedulerName` | ModelServing and Role `replicas` |
-| Pod-mutating `plugins` | `rolloutStrategy` |
+| `plugins` | `rolloutStrategy` |
 | Role identity | `maxUnavailable` and `partition` |
 | Role entry and worker templates | `recoveryPolicy` |
 | `workerReplicas` | `restartGracePeriodSeconds` |
 | | `gangPolicy` and `networkTopology` |
 
-Role and plugin lists use replace semantics so applying a revision can remove
-entries added after that revision. The serialized patch is used unchanged as
+Roles are identified by name and stored in canonical name order, so reordering
+otherwise identical Roles does not create a revision. Plugin order is preserved
+because plugin hooks execute in spec order and may mutate the same Pod. All
+plugins are revisioned because the current plugin API does not declare whether
+an `OnPodCreate` hook mutates the Pod. Role-name lists within a plugin scope are
+also canonicalized because their order is not significant.
+
+Revision membership uses replace semantics so applying a revision can remove
+Roles and plugins added after that revision. `ApplyRevision` preserves the
+operational Role properties described below while restoring the plugin chain
+exactly. The serialized patch is used unchanged as
 `ControllerRevision.Data.Raw` and as the primary hash input.
+
+`networkTopology` remains operational: changing it updates the PodGroup and
+SubGroupPolicy but does not relocate existing Pods. The new policy applies to
+subsequent scheduling and recovery. In contrast, `schedulerName` is written to
+`PodSpec.schedulerName` and requires Pod replacement to converge.
 
 `ControllerRevision.Data` is never modified after creation. The revision hash
 continues to identify workload content and is used in the ControllerRevision
@@ -100,8 +115,10 @@ Applying a revision restores revisioned fields and preserves operational
 fields from the current ModelServing.
 
 - ModelServing replicas remain unchanged.
-- A Role present in both specs keeps its current replicas.
-- A Role restored from history uses the API default replicas value of `1`.
+- A Role present in both specs keeps its current replicas and list position.
+- A Role restored from history uses the API default replicas value of `1` and
+  is appended in canonical name order after Roles retained from the current
+  spec.
 - A current Role absent from the target revision is removed.
 
 The resulting spec must still satisfy current API validation. In particular,
