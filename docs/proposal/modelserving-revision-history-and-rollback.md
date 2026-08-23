@@ -21,8 +21,6 @@ StatefulSet: revision data is immutable, equivalent historical revisions are
 reused, and rollback updates the desired spec before following the existing
 rolling update flow.
 
-Related issue: [#1584](https://github.com/volcano-sh/kthena/issues/1584).
-
 ### Motivation
 
 ModelServing already creates `ControllerRevision` objects, but the revision
