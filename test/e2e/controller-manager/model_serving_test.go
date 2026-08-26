@@ -70,6 +70,18 @@ func TestModelServingLifecycle(t *testing.T) {
 	for _, pod := range podList.Items {
 		assert.Equal(t, corev1.PodRunning, pod.Status.Phase, "Pod %s should be running", pod.Name)
 	}
+	initialMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, initialMS.Status.CurrentRevision)
+	initialHistory, err := kubeClient.AppsV1().ControllerRevisions(testNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: modelServingLabelSelector(modelServing.Name),
+	})
+	require.NoError(t, err)
+	require.Len(t, initialHistory.Items, 1)
+	initialRevision := &initialHistory.Items[0]
+	assert.Equal(t, initialMS.Status.CurrentRevision, initialRevision.Labels[controllerutils.ControllerRevisionRevisionLabelKey])
+	assert.Equal(t, controllerutils.ControllerRevisionDataVersionV1, initialRevision.Annotations[controllerutils.ControllerRevisionDataVersionAnnotation])
+	initialRevisionData := append([]byte(nil), initialRevision.Data.Raw...)
 	t.Log("Phase 1 passed: ModelServing created and ready")
 
 	// Phase 2: Update (change container image)
@@ -114,6 +126,22 @@ func TestModelServingLifecycle(t *testing.T) {
 		}
 		return true
 	}, 3*time.Minute, 5*time.Second, fmt.Sprintf("Not all pods were updated to %s", nginxAlpineImage))
+	finalMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotEqual(t, initialMS.Status.CurrentRevision, finalMS.Status.CurrentRevision)
+	history, err := kubeClient.AppsV1().ControllerRevisions(testNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: modelServingLabelSelector(modelServing.Name),
+	})
+	require.NoError(t, err)
+	require.Len(t, history.Items, 2)
+	foundInitialRevision := false
+	for i := range history.Items {
+		if history.Items[i].Labels[controllerutils.ControllerRevisionRevisionLabelKey] == initialMS.Status.CurrentRevision {
+			foundInitialRevision = true
+			assert.Equal(t, initialRevisionData, history.Items[i].Data.Raw, "historical revision data must remain immutable")
+		}
+	}
+	require.True(t, foundInitialRevision, "initial ControllerRevision should be retained")
 	t.Log("Phase 2 passed: ModelServing updated successfully")
 
 	// Phase 3: Delete

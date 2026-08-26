@@ -475,6 +475,130 @@ func TestRevisionDataHashUsesCollisionCount(t *testing.T) {
 	}
 }
 
+func TestRoleRevisionHashTracksApplicableConfiguration(t *testing.T) {
+	base := revisionTestModelServing(
+		revisionTestRole("prefill", "prefill:v1"),
+		revisionTestRole("decode", "decode:v1"),
+	)
+	base.Spec.Plugins = []workloadv1alpha1.PluginSpec{{
+		Name: "prefill-plugin",
+		Type: workloadv1alpha1.PluginTypeBuiltIn,
+		Scope: &workloadv1alpha1.PluginScope{
+			Roles:  []string{"prefill"},
+			Target: workloadv1alpha1.PluginTargetAll,
+		},
+		Config: &apiextensionsv1.JSON{Raw: []byte(`{"value":1}`)},
+	}}
+
+	hash := func(t *testing.T, ms *workloadv1alpha1.ModelServing, role string) string {
+		t.Helper()
+		got, err := RoleRevisionHash(ms, role)
+		if err != nil {
+			t.Fatalf("RoleRevisionHash(%s) error = %v", role, err)
+		}
+		return got
+	}
+	prefillHash := hash(t, base, "prefill")
+	decodeHash := hash(t, base, "decode")
+
+	operationalChange := base.DeepCopy()
+	operationalChange.Spec.Template.Roles[0].Replicas = ptr.To[int32](9)
+	if got := hash(t, operationalChange, "prefill"); got != prefillHash {
+		t.Fatal("operational replica change affected Role revision hash")
+	}
+
+	otherRoleChange := base.DeepCopy()
+	otherRoleChange.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "prefill:v2"
+	if got := hash(t, otherRoleChange, "decode"); got != decodeHash {
+		t.Fatal("unrelated Role template change affected Role revision hash")
+	}
+
+	scopedPluginChange := base.DeepCopy()
+	scopedPluginChange.Spec.Plugins[0].Config.Raw = []byte(`{"value":2}`)
+	if got := hash(t, scopedPluginChange, "prefill"); got == prefillHash {
+		t.Fatal("applicable plugin change did not affect Role revision hash")
+	}
+	if got := hash(t, scopedPluginChange, "decode"); got != decodeHash {
+		t.Fatal("plugin scoped to another Role affected Role revision hash")
+	}
+
+	schedulerChange := base.DeepCopy()
+	schedulerChange.Spec.SchedulerName = "other-scheduler"
+	if got := hash(t, schedulerChange, "prefill"); got == prefillHash {
+		t.Fatal("scheduler change did not affect prefill Role revision hash")
+	}
+	if got := hash(t, schedulerChange, "decode"); got == decodeHash {
+		t.Fatal("scheduler change did not affect decode Role revision hash")
+	}
+}
+
+func TestModelServingForControllerRevisionPreservesLegacyOperationalFields(t *testing.T) {
+	legacyRoles := []workloadv1alpha1.Role{
+		revisionTestRole("prefill", "prefill:old"),
+		revisionTestRole("restored", "restored:old"),
+	}
+	legacyRoles[0].Replicas = ptr.To[int32](2)
+	legacyRoles[0].RollingUpdateConfiguration.MaxUnavailable = ptr.To(intstr.FromInt(2))
+	data, err := json.Marshal(map[string]interface{}{"data": legacyRoles})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := revisionTestModelServing(revisionTestRole("prefill", "prefill:new"))
+	current.ObjectMeta = metav1.ObjectMeta{Name: "test-ms", Namespace: "default", UID: "test-uid"}
+	current.Spec.SchedulerName = "current-scheduler"
+	current.Spec.Plugins = []workloadv1alpha1.PluginSpec{{Name: "current-plugin", Type: workloadv1alpha1.PluginTypeBuiltIn}}
+	current.Spec.Template.Roles[0].Replicas = ptr.To[int32](5)
+	current.Spec.Template.Roles[0].RollingUpdateConfiguration.Partition = ptr.To(intstr.FromInt(1))
+	cr := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(current)}},
+		Data:       runtime.RawExtension{Raw: data},
+	}
+
+	got, err := ModelServingForControllerRevision(current, cr)
+	if err != nil {
+		t.Fatalf("ModelServingForControllerRevision() error = %v", err)
+	}
+	if got.Spec.SchedulerName != "current-scheduler" || len(got.Spec.Plugins) != 1 || got.Spec.Plugins[0].Name != "current-plugin" {
+		t.Fatal("legacy revision changed fields that it never recorded")
+	}
+	if got.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image != "prefill:old" {
+		t.Fatal("legacy Role template was not restored")
+	}
+	if got.Spec.Template.Roles[0].Replicas == nil || *got.Spec.Template.Roles[0].Replicas != 5 {
+		t.Fatal("current Role replicas were not preserved")
+	}
+	if got.Spec.Template.Roles[0].Partition == nil || got.Spec.Template.Roles[0].Partition.IntValue() != 1 {
+		t.Fatal("current Role rollout configuration was not preserved")
+	}
+	if got.Spec.Template.Roles[1].Replicas == nil || *got.Spec.Template.Roles[1].Replicas != 1 {
+		t.Fatal("restored legacy Role did not receive the default replica count")
+	}
+}
+
+func TestModelServingForControllerRevisionRejectsForeignLegacyRevision(t *testing.T) {
+	current := revisionTestModelServing(revisionTestRole("prefill", "prefill:new"))
+	current.ObjectMeta = metav1.ObjectMeta{Name: "test-ms", Namespace: "default", UID: "test-uid"}
+	data, err := json.Marshal(map[string]interface{}{
+		"data": []workloadv1alpha1.Role{revisionTestRole("prefill", "prefill:old")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := current.DeepCopy()
+	foreign.UID = "foreign-uid"
+	cr := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "foreign-legacy-revision",
+			OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(foreign)},
+		},
+		Data: runtime.RawExtension{Raw: data},
+	}
+
+	if _, err := ModelServingForControllerRevision(current, cr); err == nil {
+		t.Fatal("ModelServingForControllerRevision() error = nil")
+	}
+}
+
 func TestGenerateControllerRevisionNameBoundsLongPrefix(t *testing.T) {
 	prefix := strings.Repeat("a", 240)
 	hash := "1234567890"
