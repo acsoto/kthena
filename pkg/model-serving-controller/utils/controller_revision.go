@@ -43,6 +43,11 @@ const (
 	ControllerRevisionDataVersionAnnotation = "modelserving.volcano.sh/revision-data-version"
 	// ControllerRevisionDataVersionV1 is the current revision data format.
 	ControllerRevisionDataVersionV1 = "v1"
+	// ControllerRevisionLegacyRevisionAnnotation records the legacy revision
+	// represented by a v1 snapshot created during controller upgrade. It lets
+	// the controller keep existing workloads on their legacy identity until a
+	// subsequent spec change creates a normal v1 rollout.
+	ControllerRevisionLegacyRevisionAnnotation = "modelserving.volcano.sh/legacy-revision"
 )
 
 // CreateControllerRevision maintains the legacy wrapped Role revision format
@@ -168,8 +173,9 @@ func decodeLegacyRevisionRoles(data []byte) ([]workloadv1alpha1.Role, error) {
 const defaultRevisionHistoryLimit int32 = 10
 
 // CleanupOldControllerRevisions removes the oldest non-live revisions until
-// RevisionHistoryLimit is satisfied. Revisions referenced by status or owned
-// Pods are live and never count toward the limit.
+// RevisionHistoryLimit is satisfied. Revisions referenced by status, owned
+// Pods, or a migration snapshot's legacy identity are live and never count
+// toward the limit.
 func CleanupOldControllerRevisions(
 	ctx context.Context,
 	client kubernetes.Interface,
@@ -218,6 +224,11 @@ func CleanupOldControllerRevisions(
 		}
 		if _, exists := live[revision.Labels[ControllerRevisionRevisionLabelKey]]; exists {
 			continue
+		}
+		if represented := revision.Annotations[ControllerRevisionLegacyRevisionAnnotation]; represented != "" {
+			if _, exists := live[represented]; exists {
+				continue
+			}
 		}
 		nonLive = append(nonLive, revision)
 	}

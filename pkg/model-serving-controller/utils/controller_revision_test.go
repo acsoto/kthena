@@ -271,3 +271,46 @@ func TestCleanupOldControllerRevisionsRetainsLiveAndNewestNonLive(t *testing.T) 
 		t.Error("oldest non-live revision r3 was retained")
 	}
 }
+
+func TestCleanupOldControllerRevisionsRetainsMigrationSnapshot(t *testing.T) {
+	ctx := context.Background()
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Name: "migration-ms", Namespace: "default", UID: "migration-uid"},
+		Spec:       workloadv1alpha1.ModelServingSpec{RevisionHistoryLimit: ptr.To[int32](0)},
+		Status: workloadv1alpha1.ModelServingStatus{
+			CurrentRevision: "legacy",
+			UpdateRevision:  "legacy",
+		},
+	}
+	legacy := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            GenerateControllerRevisionName(ms.Name, "legacy"),
+			Namespace:       ms.Namespace,
+			Labels:          map[string]string{ControllerRevisionLabelKey: ms.Name, ControllerRevisionRevisionLabelKey: "legacy"},
+			OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)},
+		},
+	}
+	migration := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: GenerateControllerRevisionName(ms.Name, "v1"), Namespace: ms.Namespace,
+			Labels: map[string]string{ControllerRevisionLabelKey: ms.Name, ControllerRevisionRevisionLabelKey: "v1"},
+			Annotations: map[string]string{
+				ControllerRevisionDataVersionAnnotation:    ControllerRevisionDataVersionV1,
+				ControllerRevisionLegacyRevisionAnnotation: "legacy",
+			},
+			OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)},
+		},
+	}
+	client := kubefake.NewSimpleClientset(legacy, migration)
+
+	if err := CleanupOldControllerRevisions(ctx, client, ms); err != nil {
+		t.Fatalf("CleanupOldControllerRevisions() error = %v", err)
+	}
+	list, err := client.AppsV1().ControllerRevisions(ms.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 2 {
+		t.Fatalf("retained %d revisions, want legacy and migration snapshot", len(list.Items))
+	}
+}
