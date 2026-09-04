@@ -572,12 +572,6 @@ func (c *ModelServingController) syncModelServing(ctx context.Context, key strin
 	if revision == "" {
 		return fmt.Errorf("recorded ControllerRevision %s has no revision label", controllerRevision.Name)
 	}
-	if legacyRevision := controllerRevision.Annotations[utils.ControllerRevisionLegacyRevisionAnnotation]; legacyRevision != "" {
-		// Keep existing legacy workloads on their original identity during the
-		// one-time encoding migration. A later spec change creates a v1
-		// revision without this annotation and starts the normal rollout.
-		revision = legacyRevision
-	}
 
 	// 1. Sync the number of ServingGroups to match the expected replicas defined in spec.
 	if err := c.syncServingGroupReplicas(ctx, ms, revision); err != nil {
@@ -2270,6 +2264,10 @@ func (c *ModelServingController) UpdateModelServingStatus(ctx context.Context, m
 			// If no groups exist, handle gracefully by setting revisions to the new revision
 			if errors.Is(err, datastore.ErrServingGroupNotFound) {
 				copy := latestMS.DeepCopy()
+				revisionReferences, refsErr := c.revisionReferencesForStatus(ctx, latestMS, nil, modelServingReplicas(latestMS) > 0)
+				if refsErr != nil {
+					return refsErr
+				}
 				selectorSet := labels.Set{
 					workloadv1alpha1.ModelServingNameLabelKey: latestMS.Name,
 					workloadv1alpha1.EntryLabelKey:            utils.Entry,
@@ -2282,12 +2280,14 @@ func (c *ModelServingController) UpdateModelServingStatus(ctx context.Context, m
 				selector := selectorSet.String()
 				collisionCount := latestCollisionCount(copy.Status.CollisionCount, ms.Status.CollisionCount)
 				needsUpdate := copy.Status.CurrentRevision != revision || copy.Status.UpdateRevision != revision ||
-					copy.Status.LabelSelector != selector || !reflect.DeepEqual(copy.Status.CollisionCount, collisionCount)
+					copy.Status.LabelSelector != selector || !reflect.DeepEqual(copy.Status.CollisionCount, collisionCount) ||
+					!reflect.DeepEqual(copy.Status.RevisionReferences, revisionReferences)
 				if needsUpdate {
 					copy.Status.CurrentRevision = revision
 					copy.Status.UpdateRevision = revision
 					copy.Status.LabelSelector = selector
 					copy.Status.CollisionCount = collisionCount
+					copy.Status.RevisionReferences = revisionReferences
 					updated, updateErr := c.modelServingClient.WorkloadV1alpha1().ModelServings(copy.GetNamespace()).UpdateStatus(ctx, copy, metav1.UpdateOptions{})
 					if updateErr != nil {
 						return updateErr
@@ -2401,6 +2401,10 @@ func (c *ModelServingController) UpdateModelServingStatus(ctx context.Context, m
 		updateRevision := revision
 		var currentRevision string
 		rolloutComplete := updated == replicas && available == replicas && len(groups) == replicas
+		revisionReferences, refsErr := c.revisionReferencesForStatus(ctx, latestMS, groups, !rolloutComplete)
+		if refsErr != nil {
+			return refsErr
+		}
 
 		// First, try to use existing CurrentRevision from status if it's still valid
 		if copy.Status.CurrentRevision != "" {
@@ -2477,6 +2481,10 @@ func (c *ModelServingController) UpdateModelServingStatus(ctx context.Context, m
 			shouldUpdate = true
 			copy.Status.CollisionCount = collisionCount
 		}
+		if !reflect.DeepEqual(copy.Status.RevisionReferences, revisionReferences) {
+			shouldUpdate = true
+			copy.Status.RevisionReferences = revisionReferences
+		}
 
 		if copy.Spec.RolloutStrategy == nil || copy.Spec.RolloutStrategy.RollingUpdateConfiguration == nil || copy.Spec.RolloutStrategy.RollingUpdateConfiguration.Partition == nil {
 			// if not set spec.RolloutStrategy.RollingUpdateConfiguration.Partition,
@@ -2540,6 +2548,77 @@ func latestCollisionCount(current, desired *int32) *int32 {
 		return copyInt32Pointer(current)
 	}
 	return copyInt32Pointer(desired)
+}
+
+// revisionReferencesForStatus records every ControllerRevision still needed by
+// observed child state. During a rollout, previously recorded references are
+// retained until the rollout converges; this makes the live set durable across
+// Pod deletion and controller restart instead of relying on the in-memory store.
+func (c *ModelServingController) revisionReferencesForStatus(
+	ctx context.Context,
+	ms *workloadv1alpha1.ModelServing,
+	groups []datastore.ServingGroup,
+	retainExisting bool,
+) ([]string, error) {
+	references := make(map[string]struct{})
+	add := func(revision string) {
+		if revision != "" {
+			references[revision] = struct{}{}
+		}
+	}
+	add(ms.Status.CurrentRevision)
+	add(ms.Status.UpdateRevision)
+	if retainExisting {
+		for _, revision := range ms.Status.RevisionReferences {
+			add(revision)
+		}
+	}
+
+	for _, group := range groups {
+		add(group.Revision)
+		if c.store == nil {
+			continue
+		}
+		roles, err := c.store.GetRolesByGroup(utils.GetNamespaceName(ms), group.Name)
+		if err != nil {
+			if errors.Is(err, datastore.ErrServingGroupNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to get roles for revision references in ServingGroup %s: %w", group.Name, err)
+		}
+		for _, roleMap := range roles {
+			for _, role := range roleMap {
+				if role != nil {
+					add(role.Revision)
+				}
+			}
+		}
+	}
+
+	if c.kubeClientSet != nil {
+		selector := labels.SelectorFromSet(map[string]string{
+			workloadv1alpha1.ModelServingNameLabelKey: ms.Name,
+		})
+		pods, err := c.kubeClientSet.CoreV1().Pods(ms.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: selector.String(),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list Pods for revision references: %w", err)
+		}
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			if utils.IsOwnedByModelServingWithUID(pod, ms.UID) {
+				add(utils.ObjectRevision(pod))
+			}
+		}
+	}
+
+	result := make([]string, 0, len(references))
+	for revision := range references {
+		result = append(result, revision)
+	}
+	slices.Sort(result)
+	return result, nil
 }
 
 // getPartition resolves an absolute partition from the configuration selected
@@ -2996,11 +3075,7 @@ func (c *ModelServingController) effectiveServingGroupWorkload(
 	}
 	workload, err := c.modelServingForServingGroupRevision(ctx, ms, group.Name, group.Revision)
 	if errors.Is(err, errControllerRevisionNotFound) {
-		// A missing historical snapshot cannot be reconstructed. Keep the
-		// existing behavior for this degraded case and let normal reconciliation
-		// repair the group; never fabricate a partial historical workload.
-		klog.Warningf("ControllerRevision %s for ServingGroup %s is unavailable; using current ModelServing for PodGroup reconciliation", group.Revision, group.Name)
-		return ms, nil
+		return nil, fmt.Errorf("required ControllerRevision %s for live ServingGroup %s is missing: %w", group.Revision, group.Name, err)
 	}
 	return workload, err
 }
@@ -3207,9 +3282,8 @@ func (c *ModelServingController) modelServingForRevision(
 // modelServingForServingGroupRevision restores a historical workload for a
 // concrete ServingGroup. Replica counts are operational and are not stored in
 // v1 revision data, so historical-only Roles use the observed count while the
-// group is still present. A Role with no observed instances is omitted rather
-// than guessed as one replica; it will be handled by normal current-spec
-// reconciliation after the group is eligible for replacement.
+// group is still present. If no observed count exists, ApplyRevision's API
+// default of one replica is retained so revision membership is not lost.
 func (c *ModelServingController) modelServingForServingGroupRevision(
 	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
@@ -3226,8 +3300,8 @@ func (c *ModelServingController) modelServingForServingGroupRevision(
 		observedRoles, err = c.store.GetRolesByGroup(utils.GetNamespaceName(ms), groupName)
 		if err != nil {
 			// The group may be created in the same reconciliation and therefore have
-			// no datastore entry yet. In that case there is no observed count to
-			// restore, so remove historical-only roles with unknown cardinality.
+			// no datastore entry yet. In that case ApplyRevision's API default remains
+			// the source of truth for historical-only roles.
 			observedRoles = nil
 		}
 	}
@@ -3248,12 +3322,7 @@ func (c *ModelServingController) modelServingForServingGroupRevision(
 			roles = append(roles, role)
 			continue
 		}
-		// Legacy snapshots may include the operational count. Use it only when
-		// no live Role objects are available; observed state is authoritative
-		// whenever the historical ServingGroup still exists.
-		if role.Replicas != nil {
-			roles = append(roles, role)
-		}
+		roles = append(roles, role)
 	}
 	workload.Spec.Template.Roles = roles
 	return workload, nil

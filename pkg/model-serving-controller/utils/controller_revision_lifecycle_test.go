@@ -261,7 +261,7 @@ func TestRecordModelServingRevisionBreaksRevisionTiesByCreationTime(t *testing.T
 	}
 }
 
-func TestRecordModelServingRevisionPreservesLegacyIdentityDuringMigration(t *testing.T) {
+func TestRecordModelServingRevisionMigratesLegacyWithNormalRollout(t *testing.T) {
 	ctx := context.Background()
 	ms := lifecycleTestModelServing()
 	ms.Status.CurrentRevision = "legacy"
@@ -277,8 +277,8 @@ func TestRecordModelServingRevisionPreservesLegacyIdentityDuringMigration(t *tes
 	if err != nil {
 		t.Fatalf("record migration revision error = %v", err)
 	}
-	if got := migrated.Annotations[ControllerRevisionLegacyRevisionAnnotation]; got != "legacy" {
-		t.Fatalf("migration annotation = %q, want legacy", got)
+	if len(migrated.Annotations) != 1 || migrated.Annotations[ControllerRevisionDataVersionAnnotation] != ControllerRevisionDataVersionV1 {
+		t.Fatalf("migration annotations = %v, want only the v1 data-version marker", migrated.Annotations)
 	}
 	if !bytes.Equal(migrated.Data.Raw, data) {
 		t.Fatalf("migration data = %s, want %s", migrated.Data.Raw, data)
@@ -288,7 +288,7 @@ func TestRecordModelServingRevisionPreservesLegacyIdentityDuringMigration(t *tes
 	if err != nil {
 		t.Fatalf("reuse migration revision error = %v", err)
 	}
-	if reused.Name != migrated.Name || reused.Annotations[ControllerRevisionLegacyRevisionAnnotation] != "legacy" {
+	if reused.Name != migrated.Name || len(reused.Annotations) != 1 || reused.Annotations[ControllerRevisionDataVersionAnnotation] != ControllerRevisionDataVersionV1 {
 		t.Fatalf("reused migration revision = %s with annotations %v", reused.Name, reused.Annotations)
 	}
 
@@ -299,8 +299,15 @@ func TestRecordModelServingRevisionPreservesLegacyIdentityDuringMigration(t *tes
 	if changed.Name == migrated.Name {
 		t.Fatalf("changed data reused migration revision %q", changed.Name)
 	}
-	if got := changed.Annotations[ControllerRevisionLegacyRevisionAnnotation]; got != "" {
-		t.Fatalf("changed revision unexpectedly retained migration annotation %q", got)
+	if len(changed.Annotations) != 1 || changed.Annotations[ControllerRevisionDataVersionAnnotation] != ControllerRevisionDataVersionV1 {
+		t.Fatalf("changed revision annotations = %v, want only the v1 data-version marker", changed.Annotations)
+	}
+	reusedAfterChange, _, err := RecordModelServingRevision(ctx, client, ms, data)
+	if err != nil {
+		t.Fatalf("record reused revision after change error = %v", err)
+	}
+	if reusedAfterChange.Name != migrated.Name {
+		t.Fatalf("reused revision after change = %q, want %q", reusedAfterChange.Name, migrated.Name)
 	}
 	if !bytes.Equal(migrated.Data.Raw, data) {
 		t.Fatalf("migration data changed after new revision: got %s, want %s", migrated.Data.Raw, data)
@@ -338,8 +345,8 @@ func TestRecordModelServingRevisionMigrationIgnoresOperationalChanges(t *testing
 	if err != nil {
 		t.Fatalf("record operational revision error = %v", err)
 	}
-	if second.Name != first.Name || second.Annotations[ControllerRevisionLegacyRevisionAnnotation] != "legacy" {
-		t.Fatalf("operational change created a rollout revision: %s/%s", second.Name, second.Annotations[ControllerRevisionLegacyRevisionAnnotation])
+	if second.Name != first.Name || len(second.Annotations) != 1 || second.Annotations[ControllerRevisionDataVersionAnnotation] != ControllerRevisionDataVersionV1 {
+		t.Fatalf("operational change created a rollout revision: %s", second.Name)
 	}
 }
 

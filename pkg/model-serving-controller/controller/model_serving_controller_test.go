@@ -2450,7 +2450,7 @@ func TestSyncModelServingRecordsRevisionWhenScaledToZero(t *testing.T) {
 	assert.EqualValues(t, 0, *updated.Status.CollisionCount)
 }
 
-func TestSyncModelServingPreservesHealthyLegacyWorkloadDuringRevisionMigration(t *testing.T) {
+func TestSyncModelServingMigratesLegacyWithNormalRollout(t *testing.T) {
 	ctx := context.Background()
 	role := workloadv1alpha1.Role{
 		Name:     "decode",
@@ -2486,12 +2486,7 @@ func TestSyncModelServingPreservesHealthyLegacyWorkloadDuringRevisionMigration(t
 	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 	require.NoError(t, controller.podsInformer.GetIndexer().Add(pod))
 
-	startActions := len(kubeClient.Actions())
 	require.NoError(t, controller.syncModelServing(ctx, "default/legacy-migration"))
-	for _, action := range kubeClient.Actions()[startActions:] {
-		assert.False(t, action.Matches("delete", "pods"), "legacy migration must not delete pods: %v", action)
-		assert.False(t, action.Matches("create", "pods"), "legacy migration must not create replacement pods: %v", action)
-	}
 
 	history, err := kubeClient.AppsV1().ControllerRevisions(ms.Namespace).List(ctx, metav1.ListOptions{})
 	require.NoError(t, err)
@@ -2503,11 +2498,12 @@ func TestSyncModelServingPreservesHealthyLegacyWorkloadDuringRevisionMigration(t
 		}
 	}
 	require.NotNil(t, migrated)
-	assert.Equal(t, "legacy", migrated.Annotations[utils.ControllerRevisionLegacyRevisionAnnotation])
+	assert.Equal(t, utils.ControllerRevisionDataVersionV1, migrated.Annotations[utils.ControllerRevisionDataVersionAnnotation])
+	assert.Len(t, migrated.Annotations, 1)
 	updated, err := modelServingClient.WorkloadV1alpha1().ModelServings(ms.Namespace).Get(ctx, ms.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, "legacy", updated.Status.CurrentRevision)
-	assert.Equal(t, "legacy", updated.Status.UpdateRevision)
+	assert.Equal(t, migrated.Labels[utils.ControllerRevisionRevisionLabelKey], updated.Status.UpdateRevision)
 	legacyAfter, err := kubeClient.AppsV1().ControllerRevisions(ms.Namespace).Get(ctx, legacyRevision.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, legacyRevision.Data.Raw, legacyAfter.Data.Raw)
@@ -4654,11 +4650,13 @@ func TestHistoricalServingGroupRevisionPreservesRemovedRoleReplicas(t *testing.T
 	tests := []struct {
 		name           string
 		v1             bool
+		observed       bool
 		createRevision func(*testing.T, kubernetes.Interface, *workloadv1alpha1.ModelServing, string)
 		wantReplicas   int32
 	}{
 		{
 			name: "v1 revision uses observed count", v1: true,
+			observed: true,
 			createRevision: func(t *testing.T, client kubernetes.Interface, ms *workloadv1alpha1.ModelServing, revision string) {
 				data, err := utils.BuildRevisionData(ms)
 				require.NoError(t, err)
@@ -4668,7 +4666,18 @@ func TestHistoricalServingGroupRevisionPreservesRemovedRoleReplicas(t *testing.T
 			wantReplicas: 3,
 		},
 		{
+			name: "v1 revision uses API default without observed count", v1: true,
+			createRevision: func(t *testing.T, client kubernetes.Interface, ms *workloadv1alpha1.ModelServing, revision string) {
+				data, err := utils.BuildRevisionData(ms)
+				require.NoError(t, err)
+				_, _, err = utils.RecordModelServingRevision(context.Background(), client, ms, data)
+				require.NoError(t, err)
+			},
+			wantReplicas: 1,
+		},
+		{
 			name: "legacy revision uses stored count", v1: false,
+			observed: true,
 			createRevision: func(t *testing.T, client kubernetes.Interface, ms *workloadv1alpha1.ModelServing, revision string) {
 				_, err := utils.CreateControllerRevision(context.Background(), client, ms, revision, ms.Spec.Template.Roles)
 				require.NoError(t, err)
@@ -4716,7 +4725,7 @@ func TestHistoricalServingGroupRevisionPreservesRemovedRoleReplicas(t *testing.T
 			key := utils.GetNamespaceName(current)
 			groupName := utils.GenerateServingGroupName(current.Name, 0)
 			store.AddServingGroup(key, 0, revision)
-			for ordinal := int32(0); ordinal < tt.wantReplicas && tt.v1; ordinal++ {
+			for ordinal := int32(0); ordinal < tt.wantReplicas && tt.observed; ordinal++ {
 				store.AddRole(key, groupName, "removed", utils.GenerateRoleID("removed", int(ordinal)), revision, "")
 			}
 			controller := &ModelServingController{store: store, kubeClientSet: client}
@@ -4785,6 +4794,57 @@ func TestSyncServingGroupReplicasReconcilesHistoricalPodGroupWithHistoricalWorkl
 	assert.Equal(t, "volcano", seenScheduler)
 	assert.Equal(t, int32(1), seenRoles["decode"])
 	assert.Equal(t, int32(2), seenRoles["prefill"])
+}
+
+func TestRevisionReferencesForStatusTracksObservedRevisions(t *testing.T) {
+	ctx := context.Background()
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "revision-references",
+			UID:       types.UID("revision-references-uid"),
+		},
+		Status: workloadv1alpha1.ModelServingStatus{
+			CurrentRevision:    "status-current",
+			UpdateRevision:     "status-update",
+			RevisionReferences: []string{"durable-old"},
+		},
+	}
+	kubeClient := kubefake.NewSimpleClientset()
+	controller, err := NewModelServingController(kubeClient, kthenafake.NewSimpleClientset(), nil, apiextfake.NewSimpleClientset())
+	require.NoError(t, err)
+
+	key := utils.GetNamespaceName(ms)
+	groupName := utils.GenerateServingGroupName(ms.Name, 0)
+	controller.store.AddServingGroup(key, 0, "group-revision")
+	controller.store.AddRole(key, groupName, "decode", "decode-0", "role-revision", "role-hash")
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ms.Namespace,
+			Name:      "decode-0",
+			Labels: map[string]string{
+				workloadv1alpha1.ModelServingNameLabelKey: ms.Name,
+				workloadv1alpha1.RevisionLabelKey:         "pod-revision",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: workloadv1alpha1.SchemeGroupVersion.String(),
+				Kind:       workloadv1alpha1.ModelServingKind.Kind,
+				Name:       ms.Name,
+				UID:        ms.UID,
+			}},
+		},
+	}
+	_, err = kubeClient.CoreV1().Pods(ms.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	groups := []datastore.ServingGroup{{Name: groupName, Revision: "group-revision"}}
+	refs, err := controller.revisionReferencesForStatus(ctx, ms, groups, true)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"durable-old", "group-revision", "pod-revision", "role-revision", "status-current", "status-update"}, refs)
+
+	refs, err = controller.revisionReferencesForStatus(ctx, ms, groups, false)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"group-revision", "pod-revision", "role-revision", "status-current", "status-update"}, refs)
 }
 
 func TestUpdateModelServingStatusRefreshesAfterConflict(t *testing.T) {
@@ -8131,8 +8191,9 @@ func TestDeleteOutdatedServingGroups(t *testing.T) {
 }
 
 func TestServingGroupMaxSurgeRetainedPoolLifecycle(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
 	controller, err := NewModelServingController(
-		kubefake.NewSimpleClientset(),
+		kubeClient,
 		kthenafake.NewSimpleClientset(),
 		nil,
 		apiextfake.NewSimpleClientset(),
@@ -8161,6 +8222,8 @@ func TestServingGroupMaxSurgeRetainedPoolLifecycle(t *testing.T) {
 			}}},
 		},
 	}
+	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, "old-revision", ms.Spec.Template.Roles)
+	require.NoError(t, err)
 	key := utils.GetNamespaceName(ms)
 	for ordinal := 0; ordinal < 2; ordinal++ {
 		controller.store.AddServingGroup(key, ordinal, "old-revision")
@@ -8432,8 +8495,9 @@ func TestSyncServingGroupReplicasPreservesSparseOrdinals(t *testing.T) {
 }
 
 func TestServingGroupUpdateCreatesSurgeWithoutStoredPhase(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
 	controller, err := NewModelServingController(
-		kubefake.NewSimpleClientset(),
+		kubeClient,
 		kthenafake.NewSimpleClientset(),
 		nil,
 		apiextfake.NewSimpleClientset(),
@@ -8451,6 +8515,8 @@ func TestServingGroupUpdateCreatesSurgeWithoutStoredPhase(t *testing.T) {
 			},
 		},
 	}
+	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, "old", ms.Spec.Template.Roles)
+	require.NoError(t, err)
 	key := utils.GetNamespaceName(ms)
 	for ordinal := 0; ordinal < 2; ordinal++ {
 		controller.store.AddServingGroup(key, ordinal, "old")
@@ -8509,8 +8575,9 @@ func TestServingGroupRollingUpdateIgnoresUnavailableProtectedGroups(t *testing.T
 }
 
 func TestSyncServingGroupReplicasHonorsReducedMaxSurge(t *testing.T) {
+	kubeClient := kubefake.NewSimpleClientset()
 	controller, err := NewModelServingController(
-		kubefake.NewSimpleClientset(),
+		kubeClient,
 		kthenafake.NewSimpleClientset(),
 		nil,
 		apiextfake.NewSimpleClientset(),
@@ -8528,6 +8595,8 @@ func TestSyncServingGroupReplicasHonorsReducedMaxSurge(t *testing.T) {
 			},
 		},
 	}
+	_, err = utils.CreateControllerRevision(context.Background(), kubeClient, ms, "old", ms.Spec.Template.Roles)
+	require.NoError(t, err)
 	key := utils.GetNamespaceName(ms)
 	for ordinal := 0; ordinal < 3; ordinal++ {
 		revision := "old"
