@@ -265,9 +265,8 @@ func RevisionDataHash(data []byte, collisionCount *int32) string {
 }
 
 // ApplyRevision restores revisioned fields while preserving operational fields
-// from the current ModelServing. Historical-only Roles do not receive a
-// guessed replica count; the controller supplies an observed count when it
-// needs to reconcile an existing historical ServingGroup.
+// from the current ModelServing. Historical-only Roles use the API default of
+// one replica; runtime recovery may overlay observed replica state afterwards.
 func ApplyRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevision) (*workloadv1alpha1.ModelServing, error) {
 	if ms == nil {
 		return nil, fmt.Errorf("model serving is nil")
@@ -311,9 +310,6 @@ func ApplyRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevis
 		if _, exists := used[target.Name]; exists {
 			continue
 		}
-		// Replica count is operational state and is not present in v1 data.
-		// The controller fills it from the observed ServingGroup when it needs
-		// to reconcile a historical-only Role; never guess one replica here.
 		result.Spec.Template.Roles = append(result.Spec.Template.Roles, revisionRole(target))
 	}
 	return result, nil
@@ -323,8 +319,7 @@ func ApplyRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevis
 // use when creating workloads for a ControllerRevision. V1 revisions restore
 // every revisioned field. Legacy revisions only contain Roles, so fields that
 // were never recorded by the legacy format remain sourced from the current
-// ModelServing. Historical-only Roles carry no guessed replica count; the
-// controller hydrates missing counts from observed ServingGroup state.
+// ModelServing.
 func ModelServingForControllerRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevision) (*workloadv1alpha1.ModelServing, error) {
 	if ms == nil {
 		return nil, fmt.Errorf("model serving is nil")
@@ -359,10 +354,10 @@ func mergeRevisionRoles(current, revision []workloadv1alpha1.Role) []workloadv1a
 		role := *revision[i].DeepCopy()
 		currentRole, exists := currentByName[role.Name]
 		if !exists {
-			// Keep the historical-only Role so the controller can hydrate its
-			// replica count from observed ServingGroup state. Legacy data may
-			// contain a stored count; a nil count is retained until observation
-			// is available rather than being replaced with a guess.
+			if role.Replicas == nil {
+				defaultReplicas := int32(1)
+				role.Replicas = &defaultReplicas
+			}
 			result = append(result, role)
 			continue
 		}
@@ -394,6 +389,8 @@ func decodeRevisionPatch(data []byte) (*modelServingRevisionPatch, error) {
 func revisionRole(source modelServingRevisionRole) workloadv1alpha1.Role {
 	role := workloadv1alpha1.Role{}
 	applyRevisionRole(&role, source)
+	defaultReplicas := int32(1)
+	role.Replicas = &defaultReplicas
 	return role
 }
 

@@ -404,8 +404,8 @@ func TestApplyRevisionPreservesOperationalFields(t *testing.T) {
 	if applied.Spec.Template.Roles[0].MaxUnavailable == nil || applied.Spec.Template.Roles[1].MaxUnavailable == nil {
 		t.Error("rolling update configuration was not preserved for existing roles")
 	}
-	if applied.Spec.Template.Roles[2].Replicas != nil {
-		t.Error("historical-only v1 Role received a guessed replica count")
+	if applied.Spec.Template.Roles[2].Replicas == nil || *applied.Spec.Template.Roles[2].Replicas != 1 {
+		t.Errorf("historical-only v1 Role replicas = %v, want API default 1", applied.Spec.Template.Roles[2].Replicas)
 	}
 	if len(applied.Spec.Template.Roles) != 3 {
 		t.Fatalf("roles = %d, want 3", len(applied.Spec.Template.Roles))
