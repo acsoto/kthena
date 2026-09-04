@@ -272,36 +272,30 @@ func TestCleanupOldControllerRevisionsRetainsLiveAndNewestNonLive(t *testing.T) 
 	}
 }
 
-func TestCleanupOldControllerRevisionsRetainsMigrationSnapshot(t *testing.T) {
+func TestCleanupOldControllerRevisionsRetainsDurableRevisionReferences(t *testing.T) {
 	ctx := context.Background()
 	ms := &workloadv1alpha1.ModelServing{
-		ObjectMeta: metav1.ObjectMeta{Name: "migration-ms", Namespace: "default", UID: "migration-uid"},
+		ObjectMeta: metav1.ObjectMeta{Name: "durable-ms", Namespace: "default", UID: "durable-uid"},
 		Spec:       workloadv1alpha1.ModelServingSpec{RevisionHistoryLimit: ptr.To[int32](0)},
 		Status: workloadv1alpha1.ModelServingStatus{
-			CurrentRevision: "legacy",
-			UpdateRevision:  "legacy",
+			CurrentRevision:    "r1",
+			UpdateRevision:     "r3",
+			RevisionReferences: []string{"r2"},
 		},
 	}
-	legacy := &appsv1.ControllerRevision{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            GenerateControllerRevisionName(ms.Name, "legacy"),
-			Namespace:       ms.Namespace,
-			Labels:          map[string]string{ControllerRevisionLabelKey: ms.Name, ControllerRevisionRevisionLabelKey: "legacy"},
-			OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)},
-		},
-	}
-	migration := &appsv1.ControllerRevision{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: GenerateControllerRevisionName(ms.Name, "v1"), Namespace: ms.Namespace,
-			Labels: map[string]string{ControllerRevisionLabelKey: ms.Name, ControllerRevisionRevisionLabelKey: "v1"},
-			Annotations: map[string]string{
-				ControllerRevisionDataVersionAnnotation:    ControllerRevisionDataVersionV1,
-				ControllerRevisionLegacyRevisionAnnotation: "legacy",
+	objects := make([]runtime.Object, 0, 3)
+	for i, revision := range []string{"r1", "r2", "r3"} {
+		objects = append(objects, &appsv1.ControllerRevision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            GenerateControllerRevisionName(ms.Name, revision),
+				Namespace:       ms.Namespace,
+				Labels:          map[string]string{ControllerRevisionLabelKey: ms.Name, ControllerRevisionRevisionLabelKey: revision},
+				OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)},
 			},
-			OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)},
-		},
+			Revision: int64(i + 1),
+		})
 	}
-	client := kubefake.NewSimpleClientset(legacy, migration)
+	client := kubefake.NewSimpleClientset(objects...)
 
 	if err := CleanupOldControllerRevisions(ctx, client, ms); err != nil {
 		t.Fatalf("CleanupOldControllerRevisions() error = %v", err)
@@ -310,7 +304,13 @@ func TestCleanupOldControllerRevisionsRetainsMigrationSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Items) != 2 {
-		t.Fatalf("retained %d revisions, want legacy and migration snapshot", len(list.Items))
+	remaining := make(map[string]bool, len(list.Items))
+	for i := range list.Items {
+		remaining[list.Items[i].Labels[ControllerRevisionRevisionLabelKey]] = true
+	}
+	for _, revision := range []string{"r1", "r2", "r3"} {
+		if !remaining[revision] {
+			t.Errorf("revision %s was not retained", revision)
+		}
 	}
 }
