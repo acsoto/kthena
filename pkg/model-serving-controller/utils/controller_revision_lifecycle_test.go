@@ -261,6 +261,88 @@ func TestRecordModelServingRevisionBreaksRevisionTiesByCreationTime(t *testing.T
 	}
 }
 
+func TestRecordModelServingRevisionPreservesLegacyIdentityDuringMigration(t *testing.T) {
+	ctx := context.Background()
+	ms := lifecycleTestModelServing()
+	ms.Status.CurrentRevision = "legacy"
+	ms.Status.UpdateRevision = "legacy"
+	legacyRole := workloadv1alpha1.Role{Name: "role"}
+	client := kubefake.NewSimpleClientset()
+	if _, err := CreateControllerRevision(ctx, client, ms, "legacy", []workloadv1alpha1.Role{legacyRole}); err != nil {
+		t.Fatalf("create legacy revision error = %v", err)
+	}
+
+	data := lifecycleRevisionData("volcano")
+	migrated, _, err := RecordModelServingRevision(ctx, client, ms, data)
+	if err != nil {
+		t.Fatalf("record migration revision error = %v", err)
+	}
+	if got := migrated.Annotations[ControllerRevisionLegacyRevisionAnnotation]; got != "legacy" {
+		t.Fatalf("migration annotation = %q, want legacy", got)
+	}
+	if !bytes.Equal(migrated.Data.Raw, data) {
+		t.Fatalf("migration data = %s, want %s", migrated.Data.Raw, data)
+	}
+
+	reused, _, err := RecordModelServingRevision(ctx, client, ms, data)
+	if err != nil {
+		t.Fatalf("reuse migration revision error = %v", err)
+	}
+	if reused.Name != migrated.Name || reused.Annotations[ControllerRevisionLegacyRevisionAnnotation] != "legacy" {
+		t.Fatalf("reused migration revision = %s with annotations %v", reused.Name, reused.Annotations)
+	}
+
+	changed, _, err := RecordModelServingRevision(ctx, client, ms, lifecycleRevisionData("new-scheduler"))
+	if err != nil {
+		t.Fatalf("record changed revision error = %v", err)
+	}
+	if changed.Name == migrated.Name {
+		t.Fatalf("changed data reused migration revision %q", changed.Name)
+	}
+	if got := changed.Annotations[ControllerRevisionLegacyRevisionAnnotation]; got != "" {
+		t.Fatalf("changed revision unexpectedly retained migration annotation %q", got)
+	}
+	if !bytes.Equal(migrated.Data.Raw, data) {
+		t.Fatalf("migration data changed after new revision: got %s, want %s", migrated.Data.Raw, data)
+	}
+}
+
+func TestRecordModelServingRevisionMigrationIgnoresOperationalChanges(t *testing.T) {
+	ctx := context.Background()
+	ms := lifecycleTestModelServing()
+	ms.Status.CurrentRevision = "legacy"
+	ms.Status.UpdateRevision = "legacy"
+	client := kubefake.NewSimpleClientset()
+	if _, err := CreateControllerRevision(ctx, client, ms, "legacy", []workloadv1alpha1.Role{{Name: "role"}}); err != nil {
+		t.Fatalf("create legacy revision error = %v", err)
+	}
+	data, err := BuildRevisionData(&workloadv1alpha1.ModelServing{
+		Spec: workloadv1alpha1.ModelServingSpec{Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{Name: "role"}}}},
+	})
+	if err != nil {
+		t.Fatalf("build revision data error = %v", err)
+	}
+	first, _, err := RecordModelServingRevision(ctx, client, ms, data)
+	if err != nil {
+		t.Fatalf("record migration revision error = %v", err)
+	}
+
+	operational := ms.DeepCopy()
+	operational.Spec.Template.Roles = []workloadv1alpha1.Role{{Name: "role", Replicas: ptr.To[int32](9)}}
+	operational.Status = ms.Status
+	operationalData, err := BuildRevisionData(operational)
+	if err != nil {
+		t.Fatalf("build operational revision data error = %v", err)
+	}
+	second, _, err := RecordModelServingRevision(ctx, client, operational, operationalData)
+	if err != nil {
+		t.Fatalf("record operational revision error = %v", err)
+	}
+	if second.Name != first.Name || second.Annotations[ControllerRevisionLegacyRevisionAnnotation] != "legacy" {
+		t.Fatalf("operational change created a rollout revision: %s/%s", second.Name, second.Annotations[ControllerRevisionLegacyRevisionAnnotation])
+	}
+}
+
 func TestUpdateControllerRevisionRetriesConflict(t *testing.T) {
 	ctx := context.Background()
 	revision := &appsv1.ControllerRevision{

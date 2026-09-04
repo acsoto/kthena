@@ -64,6 +64,7 @@ func RecordModelServingRevision(
 	var latest *appsv1.ControllerRevision
 	var equivalent *appsv1.ControllerRevision
 	var maxRevision int64
+	hasV1History := false
 	for i := range history.Items {
 		revision := &history.Items[i]
 		owner := metav1.GetControllerOfNoCopy(revision)
@@ -76,6 +77,9 @@ func RecordModelServingRevision(
 		if revision.Revision > maxRevision {
 			maxRevision = revision.Revision
 		}
+		if revision.Annotations[ControllerRevisionDataVersionAnnotation] == ControllerRevisionDataVersionV1 {
+			hasV1History = true
+		}
 		if revision.Annotations[ControllerRevisionDataVersionAnnotation] == ControllerRevisionDataVersionV1 &&
 			bytes.Equal(revision.Data.Raw, data) {
 			if equivalent == nil || controllerRevisionLess(equivalent, revision) {
@@ -83,14 +87,23 @@ func RecordModelServingRevision(
 			}
 		}
 	}
+	legacyRevision := legacyRevisionForMigration(ms, history)
 
 	if latest != nil && equivalent != nil && latest.Name == equivalent.Name {
-		return latest.DeepCopy(), modelServingCollisionCount(ms), nil
+		result, err := markControllerRevisionForLegacyMigration(ctx, client, equivalent, legacyRevision)
+		if err != nil {
+			return nil, nil, err
+		}
+		return result, modelServingCollisionCount(ms), nil
 	}
 	nextRevision := maxRevision + 1
 
 	if equivalent != nil {
 		result, err := updateControllerRevision(ctx, client, equivalent, nextRevision)
+		if err != nil {
+			return nil, nil, err
+		}
+		result, err = markControllerRevisionForLegacyMigration(ctx, client, result, legacyRevision)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -119,6 +132,9 @@ func RecordModelServingRevision(
 				Raw: append([]byte(nil), data...),
 			},
 		}
+		if legacyRevision != "" && !hasV1History {
+			revision.Annotations[ControllerRevisionLegacyRevisionAnnotation] = legacyRevision
+		}
 		created, err := client.AppsV1().ControllerRevisions(ms.Namespace).Create(ctx, revision, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			existing, getErr := client.AppsV1().ControllerRevisions(ms.Namespace).Get(ctx, name, metav1.GetOptions{})
@@ -129,6 +145,10 @@ func RecordModelServingRevision(
 			if owner != nil && owner.UID == ms.UID &&
 				existing.Annotations[ControllerRevisionDataVersionAnnotation] == ControllerRevisionDataVersionV1 &&
 				bytes.Equal(existing.Data.Raw, data) {
+				existing, err = markControllerRevisionForLegacyMigration(ctx, client, existing, legacyRevision)
+				if err != nil {
+					return nil, nil, err
+				}
 				if existing.Revision < nextRevision {
 					existing, err = updateControllerRevision(ctx, client, existing, nextRevision)
 					if err != nil {
@@ -145,6 +165,122 @@ func RecordModelServingRevision(
 		}
 		return created, collisionCount, nil
 	}
+}
+
+// legacyRevisionForMigration returns the legacy revision that should remain
+// the effective workload identity during the first reconcile after upgrading
+// from the legacy revision format. It is intentionally disabled once any v1
+// snapshot exists, because a newer v1 snapshot may already have been persisted
+// while status still points at the legacy revision.
+func legacyRevisionForMigration(ms *workloadv1alpha1.ModelServing, history *appsv1.ControllerRevisionList) string {
+	if ms == nil || history == nil {
+		return ""
+	}
+
+	legacy := make(map[string]struct{})
+	hasV1History := false
+	for i := range history.Items {
+		revision := &history.Items[i]
+		owner := metav1.GetControllerOfNoCopy(revision)
+		if owner == nil || owner.UID != ms.UID {
+			continue
+		}
+		if revision.Annotations[ControllerRevisionDataVersionAnnotation] == ControllerRevisionDataVersionV1 {
+			hasV1History = true
+			continue
+		}
+		if value := revision.Labels[ControllerRevisionRevisionLabelKey]; value != "" {
+			legacy[value] = struct{}{}
+		}
+	}
+
+	if update := ms.Status.UpdateRevision; update != "" {
+		if !hasV1History {
+			if _, ok := legacy[update]; ok {
+				return update
+			}
+		}
+		// Once any v1 snapshot exists, a v1 rollout may already have been
+		// persisted even if status still points at the legacy revision. Never
+		// attach the legacy identity to that newer snapshot.
+		return ""
+	}
+	if current := ms.Status.CurrentRevision; current != "" && !hasV1History {
+		if _, ok := legacy[current]; ok {
+			return current
+		}
+	}
+
+	// Older status objects may not have populated revision fields. If there is
+	// no v1 history, preserving the latest owned legacy revision still avoids a
+	// format-only rollout during the upgrade.
+	if hasV1History {
+		return ""
+	}
+
+	var latest *appsv1.ControllerRevision
+	for i := range history.Items {
+		revision := &history.Items[i]
+		owner := metav1.GetControllerOfNoCopy(revision)
+		if owner == nil || owner.UID != ms.UID ||
+			revision.Annotations[ControllerRevisionDataVersionAnnotation] == ControllerRevisionDataVersionV1 {
+			continue
+		}
+		if latest == nil || controllerRevisionLess(latest, revision) {
+			latest = revision
+		}
+	}
+	if latest != nil {
+		return latest.Labels[ControllerRevisionRevisionLabelKey]
+	}
+	return ""
+}
+
+// markControllerRevisionForLegacyMigration stores the legacy revision
+// represented by a v1 migration snapshot without changing immutable data.
+func markControllerRevisionForLegacyMigration(
+	ctx context.Context,
+	client kubernetes.Interface,
+	revision *appsv1.ControllerRevision,
+	legacyRevision string,
+) (*appsv1.ControllerRevision, error) {
+	if revision == nil || legacyRevision == "" ||
+		revision.Annotations[ControllerRevisionDataVersionAnnotation] != ControllerRevisionDataVersionV1 {
+		return revision, nil
+	}
+	if existing := revision.Annotations[ControllerRevisionLegacyRevisionAnnotation]; existing != "" {
+		return revision, nil
+	}
+
+	clone := revision.DeepCopy()
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		if existing := clone.Annotations[ControllerRevisionLegacyRevisionAnnotation]; existing != "" {
+			return nil
+		}
+		candidate := clone.DeepCopy()
+		if candidate.Annotations == nil {
+			candidate.Annotations = make(map[string]string)
+		}
+		candidate.Annotations[ControllerRevisionLegacyRevisionAnnotation] = legacyRevision
+		updated, err := client.AppsV1().ControllerRevisions(candidate.Namespace).Update(ctx, candidate, metav1.UpdateOptions{})
+		if err == nil {
+			clone = updated
+			return nil
+		}
+		if !apierrors.IsConflict(err) {
+			return err
+		}
+		current, getErr := client.AppsV1().ControllerRevisions(clone.Namespace).Get(ctx, clone.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return fmt.Errorf("refresh controller revision %s after conflict: %w", clone.Name, getErr)
+		}
+		clone = current
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mark controller revision %s for legacy migration: %w", revision.Name, err)
+	}
+	return clone, nil
 }
 
 // controllerRevisionLess matches the ordering used by Kubernetes controller

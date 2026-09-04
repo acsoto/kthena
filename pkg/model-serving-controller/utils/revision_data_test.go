@@ -401,14 +401,11 @@ func TestApplyRevisionPreservesOperationalFields(t *testing.T) {
 	if got := *applied.Spec.Template.Roles[1].Replicas; got != 3 {
 		t.Errorf("prefill replicas = %d, want 3", got)
 	}
-	if got := *applied.Spec.Template.Roles[2].Replicas; got != 1 {
-		t.Errorf("restored replicas = %d, want 1", got)
-	}
 	if applied.Spec.Template.Roles[0].MaxUnavailable == nil || applied.Spec.Template.Roles[1].MaxUnavailable == nil {
 		t.Error("rolling update configuration was not preserved for existing roles")
 	}
-	if applied.Spec.Template.Roles[2].MaxUnavailable != nil {
-		t.Error("restored role inherited rolling update configuration")
+	if applied.Spec.Template.Roles[2].Replicas != nil {
+		t.Error("historical-only v1 Role received a guessed replica count")
 	}
 	if len(applied.Spec.Template.Roles) != 3 {
 		t.Fatalf("roles = %d, want 3", len(applied.Spec.Template.Roles))
@@ -522,6 +519,15 @@ func TestRoleRevisionHashTracksApplicableConfiguration(t *testing.T) {
 		t.Fatal("plugin scoped to another Role affected Role revision hash")
 	}
 
+	expandedPluginScope := base.DeepCopy()
+	expandedPluginScope.Spec.Plugins[0].Scope.Roles = []string{"prefill", "decode"}
+	if got := hash(t, expandedPluginScope, "prefill"); got != prefillHash {
+		t.Fatal("adding another Role to a plugin scope changed the existing Role hash")
+	}
+	if got := hash(t, expandedPluginScope, "decode"); got == decodeHash {
+		t.Fatal("adding a Role to a plugin scope did not affect the newly targeted Role hash")
+	}
+
 	schedulerChange := base.DeepCopy()
 	schedulerChange.Spec.SchedulerName = "other-scheduler"
 	if got := hash(t, schedulerChange, "prefill"); got == prefillHash {
@@ -538,6 +544,7 @@ func TestModelServingForControllerRevisionPreservesLegacyOperationalFields(t *te
 		revisionTestRole("restored", "restored:old"),
 	}
 	legacyRoles[0].Replicas = ptr.To[int32](2)
+	legacyRoles[1].Replicas = ptr.To[int32](4)
 	legacyRoles[0].RollingUpdateConfiguration.MaxUnavailable = ptr.To(intstr.FromInt(2))
 	data, err := json.Marshal(map[string]interface{}{"data": legacyRoles})
 	if err != nil {
@@ -570,8 +577,11 @@ func TestModelServingForControllerRevisionPreservesLegacyOperationalFields(t *te
 	if got.Spec.Template.Roles[0].Partition == nil || got.Spec.Template.Roles[0].Partition.IntValue() != 1 {
 		t.Fatal("current Role rollout configuration was not preserved")
 	}
-	if got.Spec.Template.Roles[1].Replicas == nil || *got.Spec.Template.Roles[1].Replicas != 1 {
-		t.Fatal("restored legacy Role did not receive the default replica count")
+	if len(got.Spec.Template.Roles) != 2 {
+		t.Fatalf("legacy revision restored %d roles, want the historical-only role with its stored count", len(got.Spec.Template.Roles))
+	}
+	if got.Spec.Template.Roles[1].Replicas == nil || *got.Spec.Template.Roles[1].Replicas != 4 {
+		t.Fatal("historical-only legacy Role did not preserve its stored replica count")
 	}
 }
 
