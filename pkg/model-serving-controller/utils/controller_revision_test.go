@@ -21,9 +21,13 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	kubefake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 )
@@ -134,6 +138,7 @@ func TestCleanupOldControllerRevisions_PreservesCurrentAndUpdateRevisions(t *tes
 			Kind:       "ModelServing",
 		},
 		Spec: workloadv1alpha1.ModelServingSpec{
+			RevisionHistoryLimit: ptr.To[int32](0),
 			Template: workloadv1alpha1.ServingGroup{
 				Roles: []workloadv1alpha1.Role{
 					{
@@ -203,4 +208,109 @@ func TestCleanupOldControllerRevisions_PreservesCurrentAndUpdateRevisions(t *tes
 	// The total number of preserved revisions should be exactly 2 (CurrentRevision and UpdateRevision)
 	assert.Equal(t, 2, len(list.Items),
 		"Should preserve exactly CurrentRevision and UpdateRevision")
+}
+
+func TestCleanupOldControllerRevisionsRetainsLiveAndNewestNonLive(t *testing.T) {
+	ctx := context.Background()
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-ms", Namespace: "default", UID: "test-uid"},
+		TypeMeta:   metav1.TypeMeta{APIVersion: workloadv1alpha1.SchemeGroupVersion.String(), Kind: "ModelServing"},
+		Spec:       workloadv1alpha1.ModelServingSpec{RevisionHistoryLimit: ptr.To[int32](1)},
+		Status: workloadv1alpha1.ModelServingStatus{
+			CurrentRevision: "r1",
+			UpdateRevision:  "r5",
+		},
+	}
+	objects := make([]runtime.Object, 0, 7)
+	for i, revision := range []string{"r1", "r2", "r3", "r4", "r5"} {
+		objects = append(objects, &appsv1.ControllerRevision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            GenerateControllerRevisionName(ms.Name, revision),
+				Namespace:       ms.Namespace,
+				Labels:          map[string]string{ControllerRevisionLabelKey: ms.Name, ControllerRevisionRevisionLabelKey: revision},
+				OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)},
+			},
+			Revision: int64(i + 1),
+		})
+	}
+	objects = append(objects,
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name:            "live-r2",
+			Namespace:       ms.Namespace,
+			Labels:          map[string]string{ControllerRevisionLabelKey: ms.Name, workloadv1alpha1.RevisionLabelKey: "r2"},
+			OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)},
+		}},
+		&appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{
+			Name:      "foreign",
+			Namespace: ms.Namespace,
+			Labels:    map[string]string{ControllerRevisionLabelKey: ms.Name, ControllerRevisionRevisionLabelKey: "foreign"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: workloadv1alpha1.SchemeGroupVersion.String(), Kind: "ModelServing", Name: ms.Name, UID: "other-uid", Controller: ptr.To(true),
+			}},
+		}},
+	)
+	client := kubefake.NewSimpleClientset(objects...)
+
+	if err := CleanupOldControllerRevisions(ctx, client, ms); err != nil {
+		t.Fatalf("CleanupOldControllerRevisions() error = %v", err)
+	}
+	list, err := client.AppsV1().ControllerRevisions(ms.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := make(map[string]bool, len(list.Items))
+	for i := range list.Items {
+		remaining[list.Items[i].Labels[ControllerRevisionRevisionLabelKey]] = true
+	}
+	for _, revision := range []string{"r1", "r2", "r4", "r5", "foreign"} {
+		if !remaining[revision] {
+			t.Errorf("revision %s was not retained", revision)
+		}
+	}
+	if remaining["r3"] {
+		t.Error("oldest non-live revision r3 was retained")
+	}
+}
+
+func TestCleanupOldControllerRevisionsRetainsDurableRevisionReferences(t *testing.T) {
+	ctx := context.Background()
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Name: "durable-ms", Namespace: "default", UID: "durable-uid"},
+		Spec:       workloadv1alpha1.ModelServingSpec{RevisionHistoryLimit: ptr.To[int32](0)},
+		Status: workloadv1alpha1.ModelServingStatus{
+			CurrentRevision:    "r1",
+			UpdateRevision:     "r3",
+			RevisionReferences: []string{"r2"},
+		},
+	}
+	objects := make([]runtime.Object, 0, 3)
+	for i, revision := range []string{"r1", "r2", "r3"} {
+		objects = append(objects, &appsv1.ControllerRevision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            GenerateControllerRevisionName(ms.Name, revision),
+				Namespace:       ms.Namespace,
+				Labels:          map[string]string{ControllerRevisionLabelKey: ms.Name, ControllerRevisionRevisionLabelKey: revision},
+				OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)},
+			},
+			Revision: int64(i + 1),
+		})
+	}
+	client := kubefake.NewSimpleClientset(objects...)
+
+	if err := CleanupOldControllerRevisions(ctx, client, ms); err != nil {
+		t.Fatalf("CleanupOldControllerRevisions() error = %v", err)
+	}
+	list, err := client.AppsV1().ControllerRevisions(ms.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := make(map[string]bool, len(list.Items))
+	for i := range list.Items {
+		remaining[list.Items[i].Labels[ControllerRevisionRevisionLabelKey]] = true
+	}
+	for _, revision := range []string{"r1", "r2", "r3"} {
+		if !remaining[revision] {
+			t.Errorf("revision %s was not retained", revision)
+		}
+	}
 }
