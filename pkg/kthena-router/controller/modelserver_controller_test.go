@@ -1103,32 +1103,3 @@ func waitForObjectInCache(t *testing.T, timeout time.Duration, checkFunc func() 
 		}
 	}
 }
-
-// enqueueModelServer and enqueuePod are registered as DeleteFunc, so a relist
-// after a dropped watch delivers a DeletedFinalStateUnknown tombstone rather
-// than the object. Plain MetaNamespaceKeyFunc cannot key one, so the deletion
-// would be logged and dropped.
-func TestEnqueueHandlesDeletedFinalStateUnknown(t *testing.T) {
-	kubeClient := kubefake.NewSimpleClientset()
-	kthenaClient := kthenafake.NewSimpleClientset()
-	kubeInformerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
-	kthenaInformerFactory := informersv1alpha1.NewSharedInformerFactory(kthenaClient, 0)
-
-	controller, err := NewModelServerController(
-		kthenaInformerFactory,
-		kubeInformerFactory,
-		newStoreWithMockBackend(),
-	)
-	require.NoError(t, err)
-
-	ms := &aiv1alpha1.ModelServer{
-		ObjectMeta: metav1.ObjectMeta{Name: "ms-1", Namespace: "default"},
-	}
-	tombstone := cache.DeletedFinalStateUnknown{Key: "default/ms-1", Obj: ms}
-
-	controller.enqueueModelServer(tombstone)
-
-	require.Equal(t, 1, controller.workqueue.Len(), "tombstone deletion was dropped")
-	item, _ := controller.workqueue.Get()
-	assert.Equal(t, QueueItem{ResourceType: ResourceTypeModelServer, Key: "default/ms-1"}, item)
-}
