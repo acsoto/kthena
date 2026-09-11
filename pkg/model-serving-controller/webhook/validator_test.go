@@ -597,6 +597,19 @@ func TestValidateMaxUnavailableForRoles(t *testing.T) {
 			}},
 		},
 		{
+			name: "allows CRD default maxUnavailable when the role has zero replicas",
+			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
+				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+				Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{
+					Name:     "prefill",
+					Replicas: ptr.To[int32](0),
+					RollingUpdateConfiguration: workloadv1alpha1.RollingUpdateConfiguration{
+						MaxUnavailable: ptr.To(intstr.FromInt(1)),
+					},
+				}}},
+			}},
+		},
+		{
 			name: "requires role rolling update for partition",
 			ms: &workloadv1alpha1.ModelServing{Spec: workloadv1alpha1.ModelServingSpec{
 				RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.ServingGroupRollingUpdate},

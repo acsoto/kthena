@@ -254,7 +254,7 @@ func validateMaxUnavailableForRoles(ms *workloadv1alpha1.ModelServing) field.Err
 			if err != nil {
 				budgetsValid = false
 				allErrs = append(allErrs, field.Invalid(maxUnavailablePath, role.MaxUnavailable, fmt.Sprintf("invalid maxUnavailable: %v", err)))
-			} else if maxUnavailable > replicas {
+			} else if replicas > 0 && maxUnavailable > replicas {
 				allErrs = append(allErrs, field.Invalid(maxUnavailablePath, role.MaxUnavailable, fmt.Sprintf("maxUnavailable cannot be greater than replicas (%d)", replicas)))
 			} else {
 				maxUnavailableValue = maxUnavailable
