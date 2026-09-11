@@ -163,3 +163,35 @@ plugins:
 - If any plugin returns an error, Pod creation fails and the controller retries via workqueue
 
 For more design details, see the [ModelServing Plugin Framework proposal](https://github.com/volcano-sh/kthena/blob/main/docs/proposal/modelserving-plugin-framework.md).
+
+## Revision history and upgrades
+
+`OnPodCreate` must render deterministically for a given revision and Pod identity.
+Its `HookRequest.ModelServing` contains the ModelServing name, namespace and UID,
+historical owner references, canonical scheduler configuration, the current Role's
+revisioned template and applicable plugin configuration. It does not expose status,
+ModelServing labels or annotations, rollout policy, replica counts from the live
+object, or other Roles. The Role replica count is fixed at one in this rendering
+context; worker replicas remain part of the revision. Plugin factories receive
+canonical configuration scoped to the Role as well. Treat the ModelServing
+context as read-only. Plugins must not derive workload configuration from
+controller revision labels or operational PodGroup annotations on the Pod; those
+are controller bookkeeping and can change independently of a Role revision.
+
+Move any Pod-rendering dependency on operational fields or external mutable state
+into `spec.plugins[].config` or the Role's Pod template. `OnPodReady` still receives
+the live ModelServing for observation. Historical recovery restores owner references
+used by the built-in LWS labels plugin. Legacy snapshots did not record these
+inputs and cannot reproduce values that have since changed.
+
+Upgrading from legacy revision identities to canonical revision history can trigger
+a one-time workload rollout even when the ModelServing spec has not changed. Role
+revision digests also change. Existing partition and availability limits still apply;
+review those limits and available capacity before upgrading. Custom plugins that
+read live operational fields during `OnPodCreate` must adopt the rendering contract
+above.
+
+Revision history limits count unused revisions. Revisions referenced by live Pods,
+current/update status, or incomplete replacements are retained in addition to the
+configured limit. A healthy partitioned rollout releases obsolete references even
+when protected replicas intentionally remain on an older revision.

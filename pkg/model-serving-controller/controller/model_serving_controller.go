@@ -25,6 +25,7 @@ import (
 	"reflect"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"istio.io/istio/pkg/util/sets"
@@ -111,8 +112,8 @@ type ModelServingController struct {
 	// nolint
 	workqueue       workqueue.RateLimitingInterface
 	store           datastore.Store
-	graceMap        sync.Map // key: podGracePeriodKey, value:time
-	initialSync     bool     // indicates whether the initial sync has been completed
+	graceMap        sync.Map    // key: podGracePeriodKey, value:time
+	initialSync     atomic.Bool // indicates whether the initial sync has been completed
 	pluginsRegistry *plugins.Registry
 	recorder        record.EventRecorder
 }
@@ -374,7 +375,7 @@ func (c *ModelServingController) updatePod(_, newObj interface{}) {
 		}
 	default:
 		klog.V(4).Infof("handleDefault: %s/%s", newPod.Namespace, newPod.Name)
-		if !c.initialSync {
+		if !c.initialSync.Load() {
 			roleName := utils.GetRoleName(newPod)
 			roleTemplateHash := c.resolveRoleTemplateHash(ms, roleName, newPod)
 			c.store.AddServingGroupAndRole(types.NamespacedName{
@@ -652,7 +653,7 @@ func (c *ModelServingController) syncAll() {
 		c.addModelServing(ms)
 	}
 
-	c.initialSync = true
+	c.initialSync.Store(true)
 }
 
 // syncServingGroupReplicas scales up or down whole ServingGroups to meet the top-level
@@ -2401,7 +2402,7 @@ func (c *ModelServingController) UpdateModelServingStatus(ctx context.Context, m
 		updateRevision := revision
 		var currentRevision string
 		rolloutComplete := updated == replicas && available == replicas && len(groups) == replicas
-		revisionReferences, refsErr := c.revisionReferencesForStatus(ctx, latestMS, groups, !rolloutComplete)
+		revisionReferences, refsErr := c.revisionReferencesForStatus(ctx, latestMS, groups, progressActive)
 		if refsErr != nil {
 			return refsErr
 		}
@@ -2551,9 +2552,9 @@ func latestCollisionCount(current, desired *int32) *int32 {
 }
 
 // revisionReferencesForStatus records every ControllerRevision still needed by
-// observed child state. During a rollout, previously recorded references are
-// retained until the rollout converges; this makes the live set durable across
-// Pod deletion and controller restart instead of relying on the in-memory store.
+// observed child state. Retain previous references while replacements are
+// incomplete, including across Pod deletion and controller restart. A healthy
+// partitioned rollout can release stale references without updating every replica.
 func (c *ModelServingController) revisionReferencesForStatus(
 	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
@@ -2885,9 +2886,12 @@ func (c *ModelServingController) CreatePodsForServingGroup(ctx context.Context, 
 
 func (c *ModelServingController) CreatePodsByRole(ctx context.Context, role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelServing, roleIndex int, servingGroupOrdinal int, revision string, roleTemplateHash string) error {
 	servingGroupName := utils.GenerateServingGroupName(ms.Name, servingGroupOrdinal)
-	// TODO(hzxuzhonghu): build the plugin chain only once per ModelServing
-	// This is not critical now, so we leave it for future optimization.
-	chain, err := c.buildPluginChain(ms)
+	// Build factories with the same role-scoped input used by Pod hooks.
+	renderingMS, err := utils.PodRenderingModelServing(ms, role.Name)
+	if err != nil {
+		return err
+	}
+	chain, err := c.buildPluginChain(renderingMS)
 	if err != nil {
 		return fmt.Errorf("build plugin chain: %w", err)
 	}
@@ -2925,8 +2929,12 @@ func (c *ModelServingController) createPod(
 	roleKind string,
 ) error {
 	if chain != nil {
+		renderingMS, err := utils.PodRenderingModelServing(ms, roleName)
+		if err != nil {
+			return err
+		}
 		req := &plugins.HookRequest{
-			ModelServing: ms,
+			ModelServing: renderingMS,
 			ServingGroup: servingGroupName,
 			RoleName:     roleName,
 			RoleID:       roleID,

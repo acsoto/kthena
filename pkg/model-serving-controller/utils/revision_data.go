@@ -15,6 +15,7 @@ package utils
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -35,7 +36,12 @@ import (
 const defaultSchedulerName = "volcano"
 
 type modelServingRevisionPatch struct {
-	Spec modelServingRevisionSpec `json:"spec"`
+	Spec     modelServingRevisionSpec `json:"spec"`
+	Metadata *revisionMetadata        `json:"metadata,omitempty"`
+}
+
+type revisionMetadata struct {
+	OwnerReferences []metav1.OwnerReference `json:"ownerReferences"`
 }
 
 type modelServingRevisionSpec struct {
@@ -56,6 +62,7 @@ type modelServingRevisionRole struct {
 }
 
 type roleRevisionData struct {
+	Metadata      *revisionMetadata             `json:"metadata,omitempty"`
 	SchedulerName string                        `json:"schedulerName"`
 	Plugins       []workloadv1alpha1.PluginSpec `json:"plugins"`
 	Role          modelServingRevisionRole      `json:"role"`
@@ -116,6 +123,7 @@ func RoleRevisionHash(ms *workloadv1alpha1.ModelServing, roleName string) (strin
 		}
 	}
 	data, err := json.Marshal(roleRevisionData{
+		Metadata:      patch.Metadata,
 		SchedulerName: patch.Spec.SchedulerName,
 		Plugins:       applicablePlugins,
 		Role:          *role,
@@ -123,7 +131,8 @@ func RoleRevisionHash(ms *workloadv1alpha1.ModelServing, roleName string) (strin
 	if err != nil {
 		return "", fmt.Errorf("marshal role revision data: %w", err)
 	}
-	return RevisionDataHash(data, nil), nil
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("%x", digest[:16]), nil
 }
 
 func pluginAppliesToRole(plugin workloadv1alpha1.PluginSpec, role modelServingRevisionRole) bool {
@@ -137,6 +146,9 @@ func pluginAppliesToRole(plugin workloadv1alpha1.PluginSpec, role modelServingRe
 }
 
 func buildRevisionPatch(ms *workloadv1alpha1.ModelServing) (*modelServingRevisionPatch, error) {
+	if ms == nil {
+		return nil, fmt.Errorf("model serving is nil")
+	}
 	normalized := ms.DeepCopy()
 	if normalized.Spec.SchedulerName == "" {
 		normalized.Spec.SchedulerName = defaultSchedulerName
@@ -192,7 +204,12 @@ func buildRevisionPatch(ms *workloadv1alpha1.ModelServing) (*modelServingRevisio
 		return roles[i].Name < roles[j].Name
 	})
 
+	var metadata *revisionMetadata
+	if len(normalized.OwnerReferences) > 0 {
+		metadata = &revisionMetadata{OwnerReferences: normalized.OwnerReferences}
+	}
 	return &modelServingRevisionPatch{
+		Metadata: metadata,
 		Spec: modelServingRevisionSpec{
 			SchedulerName: normalized.Spec.SchedulerName,
 			Plugins:       plugins,
@@ -291,6 +308,10 @@ func ApplyRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevis
 	}
 
 	result := ms.DeepCopy()
+	result.OwnerReferences = nil
+	if patch.Metadata != nil {
+		result.OwnerReferences = patch.Metadata.OwnerReferences
+	}
 	result.Spec.SchedulerName = patch.Spec.SchedulerName
 	result.Spec.Plugins = patch.Spec.Plugins
 	result.Spec.Template.Roles = make([]workloadv1alpha1.Role, 0, len(targetRoles))
@@ -403,4 +424,37 @@ func applyRevisionRole(target *workloadv1alpha1.Role, source modelServingRevisio
 	} else {
 		target.WorkerTemplate = source.WorkerTemplate.DeepCopy()
 	}
+}
+
+// PodRenderingModelServing supplies only identity and canonical, role-scoped
+// revision inputs to Pod creation plugins. Operational state must not affect
+// rendered Pods, and another Role's configuration must not affect this Role.
+func PodRenderingModelServing(ms *workloadv1alpha1.ModelServing, roleName string) (*workloadv1alpha1.ModelServing, error) {
+	patch, err := buildRevisionPatch(ms)
+	if err != nil {
+		return nil, err
+	}
+	result := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: ms.Name, Namespace: ms.Namespace, UID: ms.UID}}
+	if patch.Metadata != nil {
+		result.OwnerReferences = patch.Metadata.OwnerReferences
+	}
+	result.Spec.SchedulerName = patch.Spec.SchedulerName
+	for _, role := range patch.Spec.Template.Roles {
+		if role.Name != roleName {
+			continue
+		}
+		result.Spec.Template.Roles = []workloadv1alpha1.Role{revisionRole(role)}
+		for _, plugin := range patch.Spec.Plugins {
+			if !pluginAppliesToRole(plugin, role) {
+				continue
+			}
+			if plugin.Scope != nil && len(plugin.Scope.Roles) > 0 {
+				plugin.Scope = plugin.Scope.DeepCopy()
+				plugin.Scope.Roles = []string{roleName}
+			}
+			result.Spec.Plugins = append(result.Spec.Plugins, plugin)
+		}
+		return result, nil
+	}
+	return nil, fmt.Errorf("role %q not found", roleName)
 }

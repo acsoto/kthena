@@ -203,7 +203,7 @@ func TestNewTestController_HasSyncedQueueAndStores(t *testing.T) {
 	require.True(t, h.controller.podsInformer.HasSynced())
 	require.True(t, h.controller.servicesInformer.HasSynced())
 	require.True(t, h.controller.modelServingsInformer.HasSynced())
-	require.True(t, h.controller.initialSync)
+	require.True(t, h.controller.initialSync.Load())
 }
 
 func TestCreateOrUpdatePodGroupByServingGroupRequeue(t *testing.T) {
@@ -6578,13 +6578,13 @@ func TestSyncAllWithFailedPods(t *testing.T) {
 	startActions := len(kubeClient.Actions())
 
 	// Verify initialSync is false before syncAll
-	assert.False(t, controller.initialSync, "initialSync should be false before syncAll")
+	assert.False(t, controller.initialSync.Load(), "initialSync should be false before syncAll")
 
 	// Call syncAll - this should handle the failed pod properly after the fix
 	controller.syncAll()
 
 	// Verify initialSync is true after syncAll
-	assert.True(t, controller.initialSync, "initialSync should be true after syncAll")
+	assert.True(t, controller.initialSync.Load(), "initialSync should be true after syncAll")
 
 	assertPodDeleted(t, kubeClient, startActions, failedPod.Name, "Failed pod should be deleted after syncAll processes it")
 }
@@ -6838,7 +6838,7 @@ func TestSyncAllWithMixedPods(t *testing.T) {
 	controller.syncAll()
 
 	// Verify initialSync is true
-	assert.True(t, controller.initialSync, "initialSync should be true after syncAll")
+	assert.True(t, controller.initialSync.Load(), "initialSync should be true after syncAll")
 
 	// Verify running pod is NOT in graceMap (it's healthy)
 	_, runningInGraceMap := controller.graceMap.Load(getPodGracePeriodKey(runningPod))
@@ -7195,7 +7195,7 @@ func TestSyncAllBeforeFixBehavior(t *testing.T) {
 	startActions := len(kubeClient.Actions())
 
 	// Verify before syncAll, initialSync is false
-	assert.False(t, controller.initialSync)
+	assert.False(t, controller.initialSync.Load())
 
 	// The key test: Before the fix, calling addPod directly with initialSync=false
 	// for a failed pod would return early without processing.
@@ -9771,4 +9771,52 @@ func TestResolveRoleTemplateHash_ReturnsEmptyWhenControllerRevisionNotFound(t *t
 
 	hash := controller.resolveRoleTemplateHash(ms, roleName, pod)
 	assert.Equal(t, "", hash)
+}
+
+func TestPartitionedStatusReleasesUnusedRevisionHistory(t *testing.T) {
+	for _, limit := range []int32{0, 1} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			ctx := context.Background()
+			ms := &workloadv1alpha1.ModelServing{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "partition-gc", UID: "partition-gc"},
+				Spec: workloadv1alpha1.ModelServingSpec{
+					Replicas: ptr.To[int32](2), RevisionHistoryLimit: ptr.To(limit),
+					RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.ServingGroupRollingUpdate, RollingUpdateConfiguration: &workloadv1alpha1.RollingUpdateConfiguration{Partition: ptr.To(intstr.FromInt32(1))}},
+					Template:        workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{{Name: "decode", Replicas: ptr.To[int32](1)}}},
+				},
+				Status: workloadv1alpha1.ModelServingStatus{CurrentRevision: "A", UpdateRevision: "D", RevisionReferences: []string{"A", "B", "C", "D"}},
+			}
+			kube := kubefake.NewSimpleClientset()
+			for i, name := range []string{"A", "B", "C", "D"} {
+				cr, err := utils.CreateControllerRevision(ctx, kube, ms, name, ms.Spec.Template.Roles)
+				require.NoError(t, err)
+				cr.Revision = int64(i + 1)
+				_, err = kube.AppsV1().ControllerRevisions(ms.Namespace).Update(ctx, cr, metav1.UpdateOptions{})
+				require.NoError(t, err)
+			}
+			client := kthenafake.NewSimpleClientset(ms)
+			c, err := NewModelServingController(kube, client, nil, apiextfake.NewSimpleClientset())
+			require.NoError(t, err)
+			key := utils.GetNamespaceName(ms)
+			for i, revision := range []string{"A", "D"} {
+				c.store.AddServingGroup(key, i, revision)
+				require.NoError(t, c.store.UpdateServingGroupStatus(key, utils.GenerateServingGroupName(ms.Name, i), datastore.ServingGroupRunning))
+			}
+			require.NoError(t, c.UpdateModelServingStatus(ctx, ms, "D"))
+			current, err := client.WorkloadV1alpha1().ModelServings(ms.Namespace).Get(ctx, ms.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			assert.Equal(t, []string{"A", "D"}, current.Status.RevisionReferences)
+			history, err := kube.AppsV1().ControllerRevisions(ms.Namespace).List(ctx, metav1.ListOptions{})
+			require.NoError(t, err)
+			names := []string{}
+			for _, cr := range history.Items {
+				names = append(names, cr.Labels[utils.ControllerRevisionRevisionLabelKey])
+			}
+			want := []string{"A", "D"}
+			if limit == 1 {
+				want = append(want, "C")
+			}
+			assert.ElementsMatch(t, want, names)
+		})
+	}
 }

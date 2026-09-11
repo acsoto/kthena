@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -640,5 +641,56 @@ func revisionTestRole(name, image string) workloadv1alpha1.Role {
 				Containers: []corev1.Container{{Name: name + "-worker", Image: image}},
 			},
 		},
+	}
+}
+
+func TestPodRenderingInputsAndHistoricalOwners(t *testing.T) {
+	ms := revisionTestModelServing(revisionTestRole("decode", "decode:v1"), revisionTestRole("prefill", "prefill:v1"))
+	ms.OwnerReferences = []metav1.OwnerReference{{Kind: "LeaderWorkerSet", Name: "old-owner", UID: "old-owner"}}
+	before, err := PodRenderingModelServing(ms, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := RoleRevisionHash(ms, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hash) != 32 {
+		t.Fatalf("expected 128-bit role digest, got %q", hash)
+	}
+	data, err := BuildRevisionData(ms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := ms.DeepCopy()
+	current.Spec.Replicas = ptr.To[int32](9)
+	current.Labels = map[string]string{"mutable": "value"}
+	current.Spec.Template.Roles[1].EntryTemplate.Spec.Containers[0].Image = "prefill:v2"
+	after, err := PodRenderingModelServing(current, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("operational state or another role changed rendering inputs")
+	}
+	current.OwnerReferences[0].Name = "new-owner"
+	changedHash, err := RoleRevisionHash(current, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash == changedHash {
+		t.Fatal("owner-dependent rendering must change role identity")
+	}
+	cr := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)}, Annotations: map[string]string{ControllerRevisionDataVersionAnnotation: ControllerRevisionDataVersionV1}}, Data: runtime.RawExtension{Raw: data}}
+	restored, err := ApplyRevision(current, cr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	historical, err := PodRenderingModelServing(restored, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, historical) {
+		t.Fatal("historical rendering did not restore owner dependencies")
 	}
 }
