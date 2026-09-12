@@ -1216,6 +1216,77 @@ func TestPartitionRevisionHistoryRecovery(t *testing.T) {
 	}
 }
 
+// TestPartitionRecoveryPreservesIdentityAndCapacity covers partial Pod loss
+// while the desired spec has advanced beyond a protected ServingGroup.
+func TestPartitionRecoveryPreservesIdentityAndCapacity(t *testing.T) {
+	for _, scenario := range []string{"worker", "removed-role"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx, client, kube := setupControllerManagerE2ETest(t)
+			ms := createBasicModelServing("protected-recovery-"+scenario, 1, 3)
+			ms.Spec.RecoveryPolicy = workload.RoleRecreate
+			if scenario == "worker" {
+				ms.Spec.RecoveryPolicy = workload.NoneRestartPolicy
+				ms.Spec.Template.Roles[0].Replicas = ptr.To[int32](1)
+				ms.Spec.Template.Roles[0].WorkerReplicas = 1
+				ms.Spec.Template.Roles[0].WorkerTemplate = ms.Spec.Template.Roles[0].EntryTemplate.DeepCopy()
+			}
+			createAndWaitForModelServing(t, ctx, client, ms)
+			initial, err := client.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, ms.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.NotEmpty(t, initial.Status.CurrentRevision)
+			selector := modelServingLabelSelector(ms.Name)
+			before, err := kube.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+			require.NoError(t, err)
+			var victim, entry *corev1.Pod
+			for i := range before.Items {
+				pod := &before.Items[i]
+				if scenario == "removed-role" || pod.Labels[workload.EntryLabelKey] != controllerutils.Entry {
+					victim = pod
+				} else {
+					entry = pod
+				}
+			}
+			require.NotNil(t, victim)
+			updateModelServingWithRetry(t, ctx, client, ms.Name, func(current *workload.ModelServing) {
+				current.Spec.RolloutStrategy.RollingUpdateConfiguration.Partition = ptr.To(intstr.FromInt32(1))
+				if scenario == "removed-role" {
+					current.Spec.Template.Roles[0].Name = "decode"
+				} else {
+					current.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
+				}
+			})
+			require.Eventually(t, func() bool {
+				current, err := client.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, ms.Name, metav1.GetOptions{})
+				return err == nil && current.Status.UpdateRevision != initial.Status.CurrentRevision &&
+					current.Status.CurrentRevision == initial.Status.CurrentRevision &&
+					current.Status.RoleReplicaCounts["prefill"] == *ms.Spec.Template.Roles[0].Replicas
+			}, time.Minute, 2*time.Second, "historical capacity must be checkpointed before recovery")
+			require.NoError(t, kube.CoreV1().Pods(testNamespace).Delete(ctx, victim.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &victim.UID}}))
+			require.Eventually(t, func() bool {
+				pods, err := kube.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+				if err != nil || len(pods.Items) != len(before.Items) {
+					return false
+				}
+				replaced := false
+				for i := range pods.Items {
+					pod := &pods.Items[i]
+					if pod.DeletionTimestamp != nil || !controllerutils.IsPodRunningAndReady(pod) ||
+						controllerutils.ObjectRevision(pod) != initial.Status.CurrentRevision {
+						return false
+					}
+					if pod.Name == victim.Name {
+						replaced = pod.UID != victim.UID
+					}
+					if entry != nil && pod.Name == entry.Name && pod.UID != entry.UID {
+						return false
+					}
+				}
+				return replaced
+			}, 3*time.Minute, 2*time.Second, "recovery must preserve historical capacity and surviving entry identity")
+		})
+	}
+}
+
 // TestModelServingControllerManagerRestart verifies that ModelServing pod creation
 // is successful even when the controller-manager restarts during reconciliation.
 // NOTE: This test must remain last among ModelServing tests because it restarts the

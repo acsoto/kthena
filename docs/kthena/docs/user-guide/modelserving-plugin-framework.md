@@ -168,20 +168,22 @@ For more design details, see the [ModelServing Plugin Framework proposal](https:
 
 `OnPodCreate` must render deterministically for a given revision and Pod identity.
 Its `HookRequest.ModelServing` contains the ModelServing name, namespace and UID,
-historical owner references, canonical scheduler configuration, the current Role's
+historical owner identities (API version, kind, name and UID), canonical scheduler configuration, the current Role's
 revisioned template and applicable plugin configuration. It does not expose status,
 ModelServing labels or annotations, rollout policy, replica counts from the live
 object, or other Roles. The Role replica count is fixed at one in this rendering
 context; worker replicas remain part of the revision. Plugin factories receive
 canonical configuration scoped to the Role as well. Treat the ModelServing
-context as read-only. Plugins must not derive workload configuration from
+context as read-only. Garbage-collection flags (`controller` and
+`blockOwnerDeletion`) are not rendering inputs. Plugins must not derive workload configuration from
 controller revision labels or operational PodGroup annotations on the Pod; those
 are controller bookkeeping and can change independently of a Role revision.
 
 Move any Pod-rendering dependency on operational fields or external mutable state
 into `spec.plugins[].config` or the Role's Pod template. `OnPodReady` still receives
-the live ModelServing for observation. Historical recovery restores owner references
-used by the built-in LWS labels plugin. Legacy snapshots did not record these
+the live ModelServing for observation. Historical recovery restores owner identities
+used by the built-in LWS labels plugin only in the rendering context; applying a
+revision to a ModelServing preserves its live owner references. Legacy snapshots did not record these
 inputs and cannot reproduce values that have since changed.
 
 Upgrading from legacy revision identities to canonical revision history can trigger
@@ -202,3 +204,13 @@ Revision history limits count unused revisions. Revisions referenced by live Pod
 current/update status, or incomplete replacements are retained in addition to the
 configured limit. A healthy partitioned rollout releases obsolete references even
 when protected replicas intentionally remain on an older revision.
+
+Before changing child resources, the controller checkpoints each Role's desired
+replica count in `status.roleReplicaCounts`. Roles present in the current spec
+always use their current replica count. If a Role is removed from the spec while
+a protected ServingGroup still uses it, recovery uses its last checkpointed count,
+including after all its Pods are lost or the controller restarts. These counts
+are operational state, not part of revision identity or rollback data. Entries
+are discarded after the Role disappears from both the current spec and retained
+revision history. Workloads without an existing checkpoint can only fall back to
+observed capacity or the revision format's default.

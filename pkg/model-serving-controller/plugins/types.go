@@ -28,7 +28,9 @@ import (
 type HookRequest struct {
 	// During OnPodCreate, ModelServing contains only object identity and canonical
 	// revision inputs for this Role. Status, operational fields and other Roles
-	// are unavailable. Plugins must not use external mutable state to render Pods.
+	// are unavailable. Owner references contain historical identity fields only,
+	// without garbage-collection flags. Plugins must not use external mutable
+	// state to render Pods.
 	ModelServing *workloadv1alpha1.ModelServing
 	ServingGroup string
 	RoleName     string

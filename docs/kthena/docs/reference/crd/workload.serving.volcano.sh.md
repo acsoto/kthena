@@ -602,6 +602,7 @@ _Appears in:_
 | `updateRevision` _string_ | UpdateRevision, if not empty, indicates the ControllerRevision version targeted by<br />the current ModelServing spec. |  |  |
 | `collisionCount` _integer_ | CollisionCount tracks hash collisions for ControllerRevision names. |  |  |
 | `revisionReferences` _string array_ | RevisionReferences contains ControllerRevision identities still needed by<br />child resources during an in-progress rollout or recovery. The controller<br />retains these references until replacement resources are observed so<br />history cleanup remains safe across Pod deletion and controller restart. |  |  |
+| `roleReplicaCounts` _object (keys:string, values:integer)_ | RoleReplicaCounts records the last desired replica count for each Role.<br />Counts are retained while revision history still contains the Role, so a<br />partition-protected Role removed from spec can recover without treating<br />lost instances as a scale-down. Current spec replicas always take precedence. |  |  |
 | `labelSelector` _string_ | LabelSelector is a label query over pods that should match the replica count. |  |  |
 
 

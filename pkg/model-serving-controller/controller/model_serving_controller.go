@@ -284,9 +284,9 @@ func (c *ModelServingController) updateModelServing(old, cur interface{}) {
 		return
 	}
 
-	if reflect.DeepEqual(oldms.Spec, curms.Spec) {
-		// If the spec has not changed, we do not need to reconcile.
-		klog.V(4).InfoS("Spec has not changed, skipping update", "modelServing", klog.KObj(curms))
+	if reflect.DeepEqual(oldms.Spec, curms.Spec) && reflect.DeepEqual(oldms.OwnerReferences, curms.OwnerReferences) {
+		// Status-only changes do not require reconciliation.
+		klog.V(4).InfoS("Workload inputs have not changed, skipping update", "modelServing", klog.KObj(curms))
 		return
 	}
 
@@ -571,6 +571,10 @@ func (c *ModelServingController) syncModelServing(ctx context.Context, key strin
 	revision := controllerRevision.Labels[utils.ControllerRevisionRevisionLabelKey]
 	if revision == "" {
 		return fmt.Errorf("recorded ControllerRevision %s has no revision label", controllerRevision.Name)
+	}
+	ms, err = c.syncRoleReplicaCounts(ctx, ms)
+	if err != nil {
+		return fmt.Errorf("persist Role replica counts: %w", err)
 	}
 
 	// 1. Sync the number of ServingGroups to match the expected replicas defined in spec.
@@ -1214,7 +1218,12 @@ func (c *ModelServingController) roleTemplateForReplica(
 			return roleToApply, nil, "", "", fmt.Errorf("revision %s does not contain role %s", revisionToUse, targetRole.Name)
 		}
 	}
-	hashToUse = utils.CalRoleTemplateHash(roleToApply)
+	// A historical snapshot normalizes fields that the original template hash
+	// included. Keep the existing instance's identity while replacing its Pods.
+	hashToUse = roleObj.RoleTemplateHash
+	if hashToUse == "" {
+		hashToUse = utils.CalRoleTemplateHash(roleToApply)
+	}
 	return roleToApply, workloadToApply, revisionToUse, hashToUse, nil
 }
 
@@ -3122,10 +3131,9 @@ func (c *ModelServingController) modelServingForRevision(
 }
 
 // modelServingForServingGroupRevision restores a historical workload for a
-// concrete ServingGroup. Replica counts are operational and are not stored in
-// v1 revision data, so historical-only Roles use the observed count while the
-// group is still present. If no observed count exists, ApplyRevision's API
-// default of one replica is retained so revision membership is not lost.
+// concrete ServingGroup. Current Role counts take precedence over the last
+// desired counts checkpointed in status. Observed counts are only a fallback
+// for workloads created before capacity checkpointing was available.
 func (c *ModelServingController) modelServingForServingGroupRevision(
 	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
@@ -3158,11 +3166,11 @@ func (c *ModelServingController) modelServingForServingGroupRevision(
 			roles = append(roles, role)
 			continue
 		}
-		if observed, exists := observedRoles[role.Name]; exists && len(observed) > 0 {
+		if replicas, exists := ms.Status.RoleReplicaCounts[role.Name]; exists {
+			role.Replicas = &replicas
+		} else if observed, exists := observedRoles[role.Name]; exists && len(observed) > 0 {
 			replicas := int32(len(observed))
 			role.Replicas = &replicas
-			roles = append(roles, role)
-			continue
 		}
 		roles = append(roles, role)
 	}

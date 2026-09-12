@@ -271,6 +271,13 @@ type ModelServingStatus struct {
 	// +optional
 	RevisionReferences []string `json:"revisionReferences,omitempty"`
 
+	// RoleReplicaCounts records the last desired replica count for each Role.
+	// Counts are retained while revision history still contains the Role, so a
+	// partition-protected Role removed from spec can recover without treating
+	// lost instances as a scale-down. Current spec replicas always take precedence.
+	// +optional
+	RoleReplicaCounts map[string]int32 `json:"roleReplicaCounts,omitempty"`
+
 	// Conditions track the condition of the ModelServing.
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 

@@ -35,11 +35,16 @@ import (
 const defaultSchedulerName = "volcano"
 
 type modelServingRevisionPatch struct {
-	Spec     modelServingRevisionSpec `json:"spec"`
-	Metadata *revisionMetadata        `json:"metadata,omitempty"`
+	Spec      modelServingRevisionSpec `json:"spec"`
+	Rendering *revisionRenderingData   `json:"rendering,omitempty"`
+	// Metadata keeps snapshots written by the initial v1 implementation readable.
+	// New snapshots use Rendering so the data cannot be mistaken for API metadata.
+	Metadata *revisionRenderingData `json:"metadata,omitempty"`
 }
 
-type revisionMetadata struct {
+// revisionRenderingData is snapshot-only context, not ModelServing metadata.
+// It must never be applied to the live object by rollback.
+type revisionRenderingData struct {
 	OwnerReferences []metav1.OwnerReference `json:"ownerReferences"`
 }
 
@@ -60,9 +65,10 @@ type modelServingRevisionRole struct {
 	WorkerTemplate *workloadv1alpha1.PodTemplateSpec `json:"workerTemplate,omitempty"`
 }
 
-// BuildRevisionData returns the canonical strategic merge patch used as both
-// ControllerRevision data and the primary revision hash input. Only fields that
-// define rendered workloads are included.
+// BuildRevisionData returns the canonical spec patch and snapshot-only rendering
+// context used as ControllerRevision data and the primary revision hash input.
+// Only fields that define rendered workloads are included. ApplyRevision applies
+// the spec patch without restoring object ownership from rendering context.
 func BuildRevisionData(ms *workloadv1alpha1.ModelServing) ([]byte, error) {
 	if ms == nil {
 		return nil, fmt.Errorf("model serving is nil")
@@ -149,17 +155,22 @@ func buildRevisionPatch(ms *workloadv1alpha1.ModelServing) (*modelServingRevisio
 		return roles[i].Name < roles[j].Name
 	})
 
-	var metadata *revisionMetadata
+	var rendering *revisionRenderingData
 	if len(normalized.OwnerReferences) > 0 {
+		for i := range normalized.OwnerReferences {
+			// Ownership flags control garbage collection, not Pod rendering.
+			normalized.OwnerReferences[i].Controller = nil
+			normalized.OwnerReferences[i].BlockOwnerDeletion = nil
+		}
 		sort.Slice(normalized.OwnerReferences, func(i, j int) bool {
 			a, _ := json.Marshal(normalized.OwnerReferences[i])
 			b, _ := json.Marshal(normalized.OwnerReferences[j])
 			return bytes.Compare(a, b) < 0
 		})
-		metadata = &revisionMetadata{OwnerReferences: normalized.OwnerReferences}
+		rendering = &revisionRenderingData{OwnerReferences: normalized.OwnerReferences}
 	}
 	return &modelServingRevisionPatch{
-		Metadata: metadata,
+		Rendering: rendering,
 		Spec: modelServingRevisionSpec{
 			SchedulerName: normalized.Spec.SchedulerName,
 			Plugins:       plugins,
@@ -258,10 +269,6 @@ func ApplyRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevis
 	}
 
 	result := ms.DeepCopy()
-	result.OwnerReferences = nil
-	if patch.Metadata != nil {
-		result.OwnerReferences = patch.Metadata.OwnerReferences
-	}
 	result.Spec.SchedulerName = patch.Spec.SchedulerName
 	result.Spec.Plugins = patch.Spec.Plugins
 	result.Spec.Template.Roles = make([]workloadv1alpha1.Role, 0, len(targetRoles))
@@ -299,7 +306,21 @@ func ModelServingForControllerRevision(ms *workloadv1alpha1.ModelServing, cr *ap
 		return nil, fmt.Errorf("controller revision or its data is nil")
 	}
 	if cr.Annotations[ControllerRevisionDataVersionAnnotation] == ControllerRevisionDataVersionV1 {
-		return ApplyRevision(ms, cr)
+		result, err := ApplyRevision(ms, cr)
+		if err != nil {
+			return nil, err
+		}
+		patch, err := decodeRevisionPatch(cr.Data.Raw)
+		if err != nil {
+			return nil, err
+		}
+		// This object is a rendering context, never an API update payload.
+		// Applying a revision to the real ModelServing must preserve ownership.
+		result.OwnerReferences = nil
+		if rendering := patch.renderingData(); rendering != nil {
+			result.OwnerReferences = rendering.OwnerReferences
+		}
+		return result, nil
 	}
 	if !metav1.IsControlledBy(cr, ms) {
 		return nil, fmt.Errorf("controller revision %q is not controlled by ModelServing %s/%s", cr.Name, ms.Namespace, ms.Name)
@@ -357,6 +378,13 @@ func decodeRevisionPatch(data []byte) (*modelServingRevisionPatch, error) {
 	return &patch, nil
 }
 
+func (p *modelServingRevisionPatch) renderingData() *revisionRenderingData {
+	if p.Rendering != nil {
+		return p.Rendering
+	}
+	return p.Metadata
+}
+
 func revisionRole(source modelServingRevisionRole) workloadv1alpha1.Role {
 	role := workloadv1alpha1.Role{}
 	applyRevisionRole(&role, source)
@@ -385,8 +413,8 @@ func PodRenderingModelServing(ms *workloadv1alpha1.ModelServing, roleName string
 		return nil, err
 	}
 	result := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: ms.Name, Namespace: ms.Namespace, UID: ms.UID}}
-	if patch.Metadata != nil {
-		result.OwnerReferences = patch.Metadata.OwnerReferences
+	if rendering := patch.renderingData(); rendering != nil {
+		result.OwnerReferences = rendering.OwnerReferences
 	}
 	result.Spec.SchedulerName = patch.Spec.SchedulerName
 	for _, role := range patch.Spec.Template.Roles {

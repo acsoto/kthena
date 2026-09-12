@@ -290,9 +290,11 @@ func TestBuildRevisionDataIsStrategicMergePatchWithReplaceMembership(t *testing.
 		revisionTestRole("removed", "removed:current"),
 	)
 	current.Spec.Replicas = ptr.To[int32](4)
+	current.OwnerReferences = []metav1.OwnerReference{{Kind: "LeaderWorkerSet", Name: "current-owner", UID: "current-owner"}}
 	current.Spec.Plugins = []workloadv1alpha1.PluginSpec{{Name: "removed-plugin"}}
 	target := revisionTestModelServing(revisionTestRole("kept", "kept:target"))
 	target.Spec.Plugins = []workloadv1alpha1.PluginSpec{}
+	target.OwnerReferences = []metav1.OwnerReference{{Kind: "LeaderWorkerSet", Name: "historical-owner", UID: "historical-owner"}}
 
 	patch, err := BuildRevisionData(target)
 	if err != nil {
@@ -321,6 +323,9 @@ func TestBuildRevisionDataIsStrategicMergePatchWithReplaceMembership(t *testing.
 	}
 	if patched.Spec.Replicas == nil || *patched.Spec.Replicas != 4 {
 		t.Fatalf("patched replicas = %v, want preserved value 4", patched.Spec.Replicas)
+	}
+	if !reflect.DeepEqual(current.OwnerReferences, patched.OwnerReferences) {
+		t.Fatal("revision patch changed live ownership")
 	}
 }
 
@@ -606,6 +611,13 @@ func TestPodRenderingInputsAndHistoricalOwners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !reflect.DeepEqual(current.OwnerReferences, restored.OwnerReferences) {
+		t.Fatal("applying a revision changed the live ModelServing ownership")
+	}
+	restored, err = ModelServingForControllerRevision(current, cr)
+	if err != nil {
+		t.Fatal(err)
+	}
 	historical, err := PodRenderingModelServing(restored, "decode")
 	if err != nil {
 		t.Fatal(err)
@@ -644,7 +656,7 @@ func TestRevisionOwnerReferenceOrderIsCanonical(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Equal(a, c) {
-		t.Fatal("owner field change was lost")
+	if !bytes.Equal(a, c) {
+		t.Fatal("garbage collection flags changed workload identity")
 	}
 }
