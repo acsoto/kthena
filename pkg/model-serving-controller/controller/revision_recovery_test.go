@@ -15,18 +15,13 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apiextfake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	kubefake "k8s.io/client-go/kubernetes/fake"
-	kubetesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	kthenafake "github.com/volcano-sh/kthena/client-go/clientset/versioned/fake"
@@ -88,80 +83,6 @@ func TestHistoricalWorkerRecoveryPreservesSurvivingEntry(t *testing.T) {
 	}
 }
 
-func TestHistoricalRoleCapacitySurvivesInstanceLoss(t *testing.T) {
-	for _, survivors := range []int{2, 0} {
-		t.Run(fmt.Sprint(survivors), func(t *testing.T) {
-			ctx := context.Background()
-			old := recoveryModelServing()
-			kube := kubefake.NewSimpleClientset()
-			data, err := utils.BuildRevisionData(old)
-			require.NoError(t, err)
-			cr, _, err := utils.RecordModelServingRevision(ctx, kube, old, data)
-			require.NoError(t, err)
-			current := old.DeepCopy()
-			current.Spec.Template.Roles = nil
-			current.Status.RoleReplicaCounts = map[string]int32{"decode": 3}
-			c, err := NewModelServingController(kube, kthenafake.NewSimpleClientset(current), nil, apiextfake.NewSimpleClientset())
-			require.NoError(t, err)
-			key := utils.GetNamespaceName(current)
-			revision := cr.Labels[utils.ControllerRevisionRevisionLabelKey]
-			for i := 0; i < survivors; i++ {
-				c.store.AddServingGroupAndRole(key, "recovery-0", revision, "hash", "decode", utils.GenerateRoleID("decode", i))
-			}
-			restored, err := c.modelServingForServingGroupRevision(ctx, current, "recovery-0", revision)
-			require.NoError(t, err)
-			require.EqualValues(t, 3, *restored.Spec.Template.Roles[0].Replicas)
-		})
-	}
-}
-
-func TestRoleReplicaCountsCheckpointAndRetention(t *testing.T) {
-	ctx := context.Background()
-	ms := recoveryModelServing()
-	kube := kubefake.NewSimpleClientset()
-	client := kthenafake.NewSimpleClientset(ms)
-	c, err := NewModelServingController(kube, client, nil, apiextfake.NewSimpleClientset())
-	require.NoError(t, err)
-	data, err := utils.BuildRevisionData(ms)
-	require.NoError(t, err)
-	cr, _, err := utils.RecordModelServingRevision(ctx, kube, ms, data)
-	require.NoError(t, err)
-
-	saved, err := c.syncRoleReplicaCounts(ctx, ms)
-	require.NoError(t, err)
-	require.Equal(t, map[string]int32{"decode": 3}, saved.Status.RoleReplicaCounts)
-	require.Nil(t, ms.Status.RoleReplicaCounts, "the informer object must not be mutated")
-
-	// Operational scaling updates the checkpoint without creating a revision.
-	saved.Spec.Template.Roles[0].Replicas = ptr.To[int32](5)
-	saved, err = client.WorkloadV1alpha1().ModelServings(ms.Namespace).Update(ctx, saved, metav1.UpdateOptions{})
-	require.NoError(t, err)
-	saved, err = c.syncRoleReplicaCounts(ctx, saved)
-	require.NoError(t, err)
-	require.EqualValues(t, 5, saved.Status.RoleReplicaCounts["decode"])
-
-	// Removing the Role keeps its last desired capacity while history uses it.
-	saved.Spec.Template.Roles[0].Name = "prefill"
-	saved.Spec.Template.Roles[0].Replicas = ptr.To[int32](2)
-	saved, err = client.WorkloadV1alpha1().ModelServings(ms.Namespace).Update(ctx, saved, metav1.UpdateOptions{})
-	require.NoError(t, err)
-	saved, err = c.syncRoleReplicaCounts(ctx, saved)
-	require.NoError(t, err)
-	require.Equal(t, map[string]int32{"decode": 5, "prefill": 2}, saved.Status.RoleReplicaCounts)
-
-	// A fresh controller with no observed instances uses the durable checkpoint.
-	restarted, err := NewModelServingController(kube, client, nil, apiextfake.NewSimpleClientset())
-	require.NoError(t, err)
-	restored, err := restarted.modelServingForServingGroupRevision(ctx, saved, "recovery-0", cr.Labels[utils.ControllerRevisionRevisionLabelKey])
-	require.NoError(t, err)
-	require.EqualValues(t, 5, *restored.Spec.Template.Roles[0].Replicas)
-
-	require.NoError(t, kube.AppsV1().ControllerRevisions(ms.Namespace).Delete(ctx, cr.Name, metav1.DeleteOptions{}))
-	saved, err = c.syncRoleReplicaCounts(ctx, saved)
-	require.NoError(t, err)
-	require.Equal(t, map[string]int32{"prefill": 2}, saved.Status.RoleReplicaCounts)
-}
-
 func TestOwnerOnlyUpdateEnqueuesModelServing(t *testing.T) {
 	c, err := NewModelServingController(kubefake.NewSimpleClientset(), kthenafake.NewSimpleClientset(), nil, apiextfake.NewSimpleClientset())
 	require.NoError(t, err)
@@ -170,51 +91,4 @@ func TestOwnerOnlyUpdateEnqueuesModelServing(t *testing.T) {
 	current.OwnerReferences = []metav1.OwnerReference{{Kind: "LeaderWorkerSet", Name: "owner", UID: "owner"}}
 	c.updateModelServing(old, current)
 	require.Equal(t, 1, c.workqueue.Len())
-}
-
-func TestRecoveryCheckpointFailureStopsPodCreation(t *testing.T) {
-	ctx := context.Background()
-	ms := recoveryModelServing()
-	kube := kubefake.NewSimpleClientset()
-	client := kthenafake.NewSimpleClientset(ms)
-	client.PrependReactor("update", "modelservings", func(action kubetesting.Action) (bool, runtime.Object, error) {
-		if action.GetSubresource() == "status" {
-			return true, nil, fmt.Errorf("status unavailable")
-		}
-		return false, nil, nil
-	})
-	c, err := NewModelServingController(kube, client, nil, apiextfake.NewSimpleClientset())
-	require.NoError(t, err)
-	require.NoError(t, c.modelServingsInformer.GetStore().Add(ms))
-	require.ErrorContains(t, c.syncModelServing(ctx, "default/recovery"), "status unavailable")
-	pods, err := kube.CoreV1().Pods(ms.Namespace).List(ctx, metav1.ListOptions{})
-	require.NoError(t, err)
-	require.Empty(t, pods.Items)
-}
-
-func TestRecoveryCheckpointRetriesStatusConflict(t *testing.T) {
-	ctx := context.Background()
-	ms := recoveryModelServing()
-	client := kthenafake.NewSimpleClientset(ms)
-	attempts := 0
-	client.PrependReactor("update", "modelservings", func(action kubetesting.Action) (bool, runtime.Object, error) {
-		if action.GetSubresource() != "status" {
-			return false, nil, nil
-		}
-		attempts++
-		if attempts == 1 {
-			concurrent := ms.DeepCopy()
-			concurrent.Status.CurrentRevision = "concurrent-status"
-			require.NoError(t, client.Tracker().Update(workload.SchemeGroupVersion.WithResource("modelservings"), concurrent, ms.Namespace))
-			return true, nil, apierrors.NewConflict(schema.GroupResource{Group: workload.SchemeGroupVersion.Group, Resource: "modelservings"}, ms.Name, fmt.Errorf("conflict"))
-		}
-		return false, nil, nil
-	})
-	c, err := NewModelServingController(kubefake.NewSimpleClientset(), client, nil, apiextfake.NewSimpleClientset())
-	require.NoError(t, err)
-	saved, err := c.syncRoleReplicaCounts(ctx, ms)
-	require.NoError(t, err)
-	require.Equal(t, 2, attempts)
-	require.Equal(t, "concurrent-status", saved.Status.CurrentRevision)
-	require.EqualValues(t, 3, saved.Status.RoleReplicaCounts["decode"])
 }

@@ -17732,16 +17732,6 @@ spec:
                 items:
                   type: string
                 type: array
-              roleReplicaCounts:
-                additionalProperties:
-                  format: int32
-                  type: integer
-                description: |-
-                  RoleReplicaCounts records the last desired replica count for each Role.
-                  Counts are retained while revision history still contains the Role, so a
-                  partition-protected Role removed from spec can recover without treating
-                  lost instances as a scale-down. Current spec replicas always take precedence.
-                type: object
               updateRevision:
                 description: |-
                   UpdateRevision, if not empty, indicates the ControllerRevision version targeted by

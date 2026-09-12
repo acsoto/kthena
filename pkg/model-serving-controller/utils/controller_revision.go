@@ -198,9 +198,10 @@ func CleanupOldControllerRevisions(
 			live[revision] = struct{}{}
 		}
 	}
-	pods, err := client.CoreV1().Pods(ms.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: selector.String(),
-	})
+	// Pod template metadata is user-controlled and can overwrite controller
+	// bookkeeping labels. Discover every Pod in the namespace and use the
+	// ModelServing UID as the ownership boundary instead of relying on labels.
+	pods, err := client.CoreV1().Pods(ms.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("list Pods referencing ControllerRevisions: %w", err)
 	}

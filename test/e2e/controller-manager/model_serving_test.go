@@ -1216,20 +1216,18 @@ func TestPartitionRevisionHistoryRecovery(t *testing.T) {
 	}
 }
 
-// TestPartitionRecoveryPreservesIdentityAndCapacity covers partial Pod loss
-// while the desired spec has advanced beyond a protected ServingGroup.
-func TestPartitionRecoveryPreservesIdentityAndCapacity(t *testing.T) {
-	for _, scenario := range []string{"worker", "removed-role"} {
+// TestPartitionRecoveryPreservesSurvivingEntry covers partial Pod loss while
+// the desired spec has advanced beyond a protected ServingGroup.
+func TestPartitionRecoveryPreservesSurvivingEntry(t *testing.T) {
+	for _, scenario := range []string{"worker"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx, client, kube := setupControllerManagerE2ETest(t)
 			ms := createBasicModelServing("protected-recovery-"+scenario, 1, 3)
 			ms.Spec.RecoveryPolicy = workload.RoleRecreate
-			if scenario == "worker" {
-				ms.Spec.RecoveryPolicy = workload.NoneRestartPolicy
-				ms.Spec.Template.Roles[0].Replicas = ptr.To[int32](1)
-				ms.Spec.Template.Roles[0].WorkerReplicas = 1
-				ms.Spec.Template.Roles[0].WorkerTemplate = ms.Spec.Template.Roles[0].EntryTemplate.DeepCopy()
-			}
+			ms.Spec.RecoveryPolicy = workload.NoneRestartPolicy
+			ms.Spec.Template.Roles[0].Replicas = ptr.To[int32](1)
+			ms.Spec.Template.Roles[0].WorkerReplicas = 1
+			ms.Spec.Template.Roles[0].WorkerTemplate = ms.Spec.Template.Roles[0].EntryTemplate.DeepCopy()
 			createAndWaitForModelServing(t, ctx, client, ms)
 			initial, err := client.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, ms.Name, metav1.GetOptions{})
 			require.NoError(t, err)
@@ -1240,7 +1238,7 @@ func TestPartitionRecoveryPreservesIdentityAndCapacity(t *testing.T) {
 			var victim, entry *corev1.Pod
 			for i := range before.Items {
 				pod := &before.Items[i]
-				if scenario == "removed-role" || pod.Labels[workload.EntryLabelKey] != controllerutils.Entry {
+				if pod.Labels[workload.EntryLabelKey] != controllerutils.Entry {
 					victim = pod
 				} else {
 					entry = pod
@@ -1249,18 +1247,13 @@ func TestPartitionRecoveryPreservesIdentityAndCapacity(t *testing.T) {
 			require.NotNil(t, victim)
 			updateModelServingWithRetry(t, ctx, client, ms.Name, func(current *workload.ModelServing) {
 				current.Spec.RolloutStrategy.RollingUpdateConfiguration.Partition = ptr.To(intstr.FromInt32(1))
-				if scenario == "removed-role" {
-					current.Spec.Template.Roles[0].Name = "decode"
-				} else {
-					current.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
-				}
+				current.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
 			})
 			require.Eventually(t, func() bool {
 				current, err := client.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, ms.Name, metav1.GetOptions{})
 				return err == nil && current.Status.UpdateRevision != initial.Status.CurrentRevision &&
-					current.Status.CurrentRevision == initial.Status.CurrentRevision &&
-					current.Status.RoleReplicaCounts["prefill"] == *ms.Spec.Template.Roles[0].Replicas
-			}, time.Minute, 2*time.Second, "historical capacity must be checkpointed before recovery")
+					current.Status.CurrentRevision == initial.Status.CurrentRevision
+			}, time.Minute, 2*time.Second, "rollout must target a new revision while preserving the current revision before recovery")
 			require.NoError(t, kube.CoreV1().Pods(testNamespace).Delete(ctx, victim.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &victim.UID}}))
 			require.Eventually(t, func() bool {
 				pods, err := kube.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})

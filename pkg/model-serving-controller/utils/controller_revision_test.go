@@ -314,3 +314,49 @@ func TestCleanupOldControllerRevisionsRetainsDurableRevisionReferences(t *testin
 		}
 	}
 }
+
+func TestCleanupOldControllerRevisionsFindsOwnedPodWithoutModelServingLabel(t *testing.T) {
+	ctx := context.Background()
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Name: "label-overwrite", Namespace: "default", UID: "label-overwrite-uid"},
+		Spec:       workloadv1alpha1.ModelServingSpec{RevisionHistoryLimit: ptr.To[int32](0)},
+		Status: workloadv1alpha1.ModelServingStatus{
+			CurrentRevision: "current",
+			UpdateRevision:  "current",
+		},
+	}
+	oldRevision := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            GenerateControllerRevisionName(ms.Name, "old"),
+			Namespace:       ms.Namespace,
+			Labels:          map[string]string{ControllerRevisionLabelKey: ms.Name, ControllerRevisionRevisionLabelKey: "old"},
+			OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)},
+		},
+		Revision: 1,
+	}
+	currentRevision := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            GenerateControllerRevisionName(ms.Name, "current"),
+			Namespace:       ms.Namespace,
+			Labels:          map[string]string{ControllerRevisionLabelKey: ms.Name, ControllerRevisionRevisionLabelKey: "current"},
+			OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)},
+		},
+		Revision: 2,
+	}
+	ownedPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:      "old-pod",
+		Namespace: ms.Namespace,
+		Labels:    map[string]string{workloadv1alpha1.RevisionLabelKey: "old"},
+		OwnerReferences: []metav1.OwnerReference{
+			newModelServingOwnerRef(ms),
+		},
+	}}
+	client := kubefake.NewSimpleClientset(oldRevision, currentRevision, ownedPod)
+
+	if err := CleanupOldControllerRevisions(ctx, client, ms); err != nil {
+		t.Fatalf("CleanupOldControllerRevisions() error = %v", err)
+	}
+	if _, err := GetControllerRevision(ctx, client, ms, "old"); err != nil {
+		t.Fatalf("owned Pod's revision was deleted: %v", err)
+	}
+}

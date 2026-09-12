@@ -518,10 +518,13 @@ func TestModelServingForControllerRevisionPreservesLegacyOperationalFields(t *te
 		t.Fatal("current Role rollout configuration was not preserved")
 	}
 	if len(got.Spec.Template.Roles) != 2 {
-		t.Fatalf("legacy revision restored %d roles, want the historical-only role with its stored count", len(got.Spec.Template.Roles))
+		t.Fatalf("legacy revision restored %d roles, want the historical-only role", len(got.Spec.Template.Roles))
 	}
-	if got.Spec.Template.Roles[1].Replicas == nil || *got.Spec.Template.Roles[1].Replicas != 4 {
-		t.Fatal("historical-only legacy Role did not preserve its stored replica count")
+	if got.Spec.Template.Roles[1].Replicas == nil || *got.Spec.Template.Roles[1].Replicas != 1 {
+		t.Fatal("historical-only legacy Role did not use the API default replica count")
+	}
+	if got.Spec.Template.Roles[1].RollingUpdateConfiguration != (workloadv1alpha1.RollingUpdateConfiguration{}) {
+		t.Fatal("historical-only legacy Role restored operational rollout settings")
 	}
 }
 

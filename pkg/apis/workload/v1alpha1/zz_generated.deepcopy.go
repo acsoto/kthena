@@ -698,13 +698,6 @@ func (in *ModelServingStatus) DeepCopyInto(out *ModelServingStatus) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
-	if in.RoleReplicaCounts != nil {
-		in, out := &in.RoleReplicaCounts, &out.RoleReplicaCounts
-		*out = make(map[string]int32, len(*in))
-		for key, val := range *in {
-			(*out)[key] = val
-		}
-	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

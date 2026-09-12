@@ -244,7 +244,7 @@ func RevisionDataHash(data []byte, collisionCount *int32) string {
 
 // ApplyRevision restores revisioned fields while preserving operational fields
 // from the current ModelServing. Historical-only Roles use the API default of
-// one replica; runtime recovery may overlay observed replica state afterwards.
+// one replica.
 func ApplyRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevision) (*workloadv1alpha1.ModelServing, error) {
 	if ms == nil {
 		return nil, fmt.Errorf("model serving is nil")
@@ -346,10 +346,12 @@ func mergeRevisionRoles(current, revision []workloadv1alpha1.Role) []workloadv1a
 		role := *revision[i].DeepCopy()
 		currentRole, exists := currentByName[role.Name]
 		if !exists {
-			if role.Replicas == nil {
-				defaultReplicas := int32(1)
-				role.Replicas = &defaultReplicas
-			}
+			// Replicas and rollout settings are operational fields. A legacy
+			// snapshot may contain them because the old format stored the whole
+			// Role, but historical-only Roles follow the v1 default semantics.
+			defaultReplicas := int32(1)
+			role.Replicas = &defaultReplicas
+			role.RollingUpdateConfiguration = workloadv1alpha1.RollingUpdateConfiguration{}
 			result = append(result, role)
 			continue
 		}

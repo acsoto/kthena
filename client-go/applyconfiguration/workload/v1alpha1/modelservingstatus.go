@@ -34,7 +34,6 @@ type ModelServingStatusApplyConfiguration struct {
 	UpdateRevision     *string                          `json:"updateRevision,omitempty"`
 	CollisionCount     *int32                           `json:"collisionCount,omitempty"`
 	RevisionReferences []string                         `json:"revisionReferences,omitempty"`
-	RoleReplicaCounts  map[string]int32                 `json:"roleReplicaCounts,omitempty"`
 	Conditions         []v1.ConditionApplyConfiguration `json:"conditions,omitempty"`
 	LabelSelector      *string                          `json:"labelSelector,omitempty"`
 }
@@ -115,20 +114,6 @@ func (b *ModelServingStatusApplyConfiguration) WithCollisionCount(value int32) *
 func (b *ModelServingStatusApplyConfiguration) WithRevisionReferences(values ...string) *ModelServingStatusApplyConfiguration {
 	for i := range values {
 		b.RevisionReferences = append(b.RevisionReferences, values[i])
-	}
-	return b
-}
-
-// WithRoleReplicaCounts puts the entries into the RoleReplicaCounts field in the declarative configuration
-// and returns the receiver, so that objects can be build by chaining "With" function invocations.
-// If called multiple times, the entries provided by each call will be put on the RoleReplicaCounts field,
-// overwriting an existing map entries in RoleReplicaCounts field with the same key.
-func (b *ModelServingStatusApplyConfiguration) WithRoleReplicaCounts(entries map[string]int32) *ModelServingStatusApplyConfiguration {
-	if b.RoleReplicaCounts == nil && len(entries) > 0 {
-		b.RoleReplicaCounts = make(map[string]int32, len(entries))
-	}
-	for k, v := range entries {
-		b.RoleReplicaCounts[k] = v
 	}
 	return b
 }

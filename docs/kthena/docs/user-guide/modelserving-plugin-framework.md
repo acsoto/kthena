@@ -193,24 +193,15 @@ review those limits and available capacity before upgrading. Custom plugins that
 read live operational fields during `OnPodCreate` must adopt the rendering contract
 above.
 
-RoleRollingUpdate continues to compare Role templates using the existing template
-hash. Scheduler and plugin changes are recorded in ModelServing history, but do
-not independently trigger a Role rollout. A ServingGroup retains its previous
-revision while a Role still has different canonical rendering inputs, so status
-does not report these unapplied changes as converged. Canonical Role rollouts and
-upgrade compatibility are deferred to follow-up changes.
+Both rollout strategies compare the applicable revisioned inputs using the same
+canonical rendering semantics as revision history. Under RoleRollingUpdate, a
+Role is outdated when its role-scoped rendering inputs differ, so scheduler and
+applicable plugin changes trigger Role replacement as required. Operational
+fields do not trigger replacement. When a legacy revision is first reconciled
+after upgrade, it is migrated through the selected rollout strategy once, even
+if the rendered inputs are otherwise unchanged.
 
 Revision history limits count unused revisions. Revisions referenced by live Pods,
 current/update status, or incomplete replacements are retained in addition to the
 configured limit. A healthy partitioned rollout releases obsolete references even
 when protected replicas intentionally remain on an older revision.
-
-Before changing child resources, the controller checkpoints each Role's desired
-replica count in `status.roleReplicaCounts`. Roles present in the current spec
-always use their current replica count. If a Role is removed from the spec while
-a protected ServingGroup still uses it, recovery uses its last checkpointed count,
-including after all its Pods are lost or the controller restarts. These counts
-are operational state, not part of revision identity or rollback data. Entries
-are discarded after the Role disappears from both the current spec and retained
-revision history. Workloads without an existing checkpoint can only fall back to
-observed capacity or the revision format's default.

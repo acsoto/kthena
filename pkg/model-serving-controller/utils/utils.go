@@ -294,7 +294,6 @@ func IsOwnedByModelServingWithUID(obj metav1.Object, uid types.UID) bool {
 			return true
 		}
 	}
-	klog.Warningf("object %s/%s is not owned by ModelServing with UID %s", obj.GetNamespace(), obj.GetName(), uid)
 	return false
 }
 
