@@ -4604,7 +4604,7 @@ func TestHistoricalServingGroupRevisionUsesDocumentedReplicaSemantics(t *testing
 				store.AddRole(key, groupName, "removed", utils.GenerateRoleID("removed", int(ordinal)), revision, "")
 			}
 			controller := &ModelServingController{store: store, kubeClientSet: client}
-			workload, err := controller.modelServingForServingGroupRevision(ctx, current, groupName, revision)
+			workload, err := controller.modelServingForRevision(ctx, current, revision)
 			require.NoError(t, err)
 			var found *workloadv1alpha1.Role
 			for i := range workload.Spec.Template.Roles {
@@ -9457,48 +9457,6 @@ func TestFindOutdatedRolesInServingGroups_NoRevisionIdentityMissingRoleTemplateH
 	result := controller.findOutdatedRolesInServingGroups(ms, []datastore.ServingGroup{{Name: "test-ms-0", Revision: revision, Status: datastore.ServingGroupRunning}}, revision)
 
 	assert.Empty(t, result, "legacy role with missing roleTemplateHash should not be treated as outdated by default")
-}
-
-func TestResolveRoleTemplateHashForComparison_FromControllerRevision(t *testing.T) {
-	ns := "default"
-	msName := "test-ms"
-	oldRevision := "old-revision"
-	roleName := "prefill"
-
-	oldRole := workloadv1alpha1.Role{
-		Name:     roleName,
-		Replicas: ptr.To[int32](1),
-		EntryTemplate: workloadv1alpha1.PodTemplateSpec{
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "nginx:1.25"}}},
-		},
-	}
-
-	ms := &workloadv1alpha1.ModelServing{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: ns,
-			Name:      msName,
-		},
-		Spec: workloadv1alpha1.ModelServingSpec{
-			Template: workloadv1alpha1.ServingGroup{
-				Roles: []workloadv1alpha1.Role{oldRole},
-			},
-		},
-	}
-
-	kubeClient := kubefake.NewSimpleClientset()
-	_, err := utils.CreateControllerRevision(context.TODO(), kubeClient, ms, oldRevision, []workloadv1alpha1.Role{oldRole})
-	assert.NoError(t, err)
-
-	controller := &ModelServingController{kubeClientSet: kubeClient}
-	hash, ok := controller.resolveRoleTemplateHashForComparison(
-		ms,
-		datastore.ServingGroup{Name: "test-ms-0", Revision: oldRevision},
-		roleName,
-		datastore.Role{Name: "prefill-0", RoleTemplateHash: ""},
-	)
-
-	assert.True(t, ok)
-	assert.Equal(t, utils.CalRoleTemplateHash(oldRole), hash)
 }
 
 func TestResolveRoleTemplateHash_UsesPodRevisionControllerRevision(t *testing.T) {

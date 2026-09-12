@@ -168,8 +168,8 @@ func decodeLegacyRevisionRoles(data []byte) ([]workloadv1alpha1.Role, error) {
 const defaultRevisionHistoryLimit int32 = 10
 
 // CleanupOldControllerRevisions removes the oldest non-live revisions until
-// RevisionHistoryLimit is satisfied. Revisions referenced by status, durable
-// status references, or owned Pods are live and never count toward the limit.
+// RevisionHistoryLimit is satisfied. CurrentRevision, UpdateRevision, and
+// persisted RevisionReferences are the authoritative live revision pins.
 func CleanupOldControllerRevisions(
 	ctx context.Context,
 	client kubernetes.Interface,
@@ -198,23 +198,6 @@ func CleanupOldControllerRevisions(
 			live[revision] = struct{}{}
 		}
 	}
-	// Pod template metadata is user-controlled and can overwrite controller
-	// bookkeeping labels. Discover every Pod in the namespace and use the
-	// ModelServing UID as the ownership boundary instead of relying on labels.
-	pods, err := client.CoreV1().Pods(ms.Namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("list Pods referencing ControllerRevisions: %w", err)
-	}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		if !IsOwnedByModelServingWithUID(pod, ms.UID) {
-			continue
-		}
-		if revision := ObjectRevision(pod); revision != "" {
-			live[revision] = struct{}{}
-		}
-	}
-
 	nonLive := make([]*appsv1.ControllerRevision, 0, len(list.Items))
 	for i := range list.Items {
 		revision := &list.Items[i]

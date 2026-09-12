@@ -88,6 +88,10 @@ func BuildRoleRevisionData(ms *workloadv1alpha1.ModelServing, roleName string) (
 	if err != nil {
 		return nil, err
 	}
+	return buildRoleRevisionDataFromPatch(patch, roleName)
+}
+
+func buildRoleRevisionDataFromPatch(patch *modelServingRevisionPatch, roleName string) ([]byte, error) {
 	for _, role := range patch.Spec.Template.Roles {
 		if role.Name != roleName {
 			continue
@@ -120,6 +124,20 @@ func RoleRevisionHash(ms *workloadv1alpha1.ModelServing, roleName string) (strin
 		return "", err
 	}
 	return RevisionDataHash(data, nil), nil
+}
+
+// RoleRevisionHashFromRevisionData derives the same Role identity directly
+// from canonical ControllerRevision data without reconstructing a workload.
+func RoleRevisionHashFromRevisionData(data []byte, roleName string) (string, error) {
+	patch, err := decodeRevisionPatch(data)
+	if err != nil {
+		return "", err
+	}
+	roleData, err := buildRoleRevisionDataFromPatch(patch, roleName)
+	if err != nil {
+		return "", err
+	}
+	return RevisionDataHash(roleData, nil), nil
 }
 
 func pluginAppliesToRole(plugin workloadv1alpha1.PluginSpec, role modelServingRevisionRole) bool {

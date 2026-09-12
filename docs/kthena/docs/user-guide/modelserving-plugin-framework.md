@@ -192,7 +192,8 @@ Operational fields do not trigger replacement. When a legacy revision is first
 reconciled after upgrade, it is migrated through the selected rollout strategy
 once, even if the rendered inputs are otherwise unchanged.
 
-Revision history limits count unused revisions. Revisions referenced by live Pods,
-current/update status, or incomplete replacements are retained in addition to the
-configured limit. A healthy partitioned rollout releases obsolete references even
-when protected replicas intentionally remain on an older revision.
+Revision history limits count unused revisions. Revisions referenced by
+`CurrentRevision`, `UpdateRevision`, or persisted `RevisionReferences` are retained
+in addition to the configured limit. The controller refreshes those references
+from observed child state during reconciliation, so a healthy partitioned rollout
+can release obsolete references after protected replicas move forward.

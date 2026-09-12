@@ -133,6 +133,17 @@ func TestRoleRevisionHashUsesApplicableCanonicalInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	revisionData, err := BuildRevisionData(ms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromRevisionData, err := RoleRevisionHashFromRevisionData(revisionData, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromRevisionData != base {
+		t.Fatalf("Role identity from revision data = %q, want %q", fromRevisionData, base)
+	}
 	operational := ms.DeepCopy()
 	operational.Spec.Replicas = ptr.To[int32](8)
 	operational.Spec.RecoveryPolicy = workloadv1alpha1.NoneRestartPolicy

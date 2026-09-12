@@ -27,6 +27,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/model-serving-controller/datastore"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/plugins"
 	"github.com/volcano-sh/kthena/pkg/model-serving-controller/utils"
 )
@@ -135,6 +136,12 @@ func TestCreatePodRestoresReservedMetadataAfterTemplateAndPlugin(t *testing.T) {
 	assert.Equal(t, workloadv1alpha1.ModelServingKind.Kind, owner.Kind)
 	assert.Equal(t, ms.Name, owner.Name)
 	assert.Equal(t, ms.UID, owner.UID)
+
+	controller.store = datastore.New()
+	references, err := controller.revisionReferencesForStatus(ctx, ms, nil, false)
+	require.NoError(t, err)
+	require.Equal(t, []string{revision}, references, "revision refresh must observe the authoritative Pod identity")
+	ms.Status.RevisionReferences = references
 
 	_, err = utils.CreateControllerRevision(ctx, kubeClient, ms, revision, []workloadv1alpha1.Role{role})
 	require.NoError(t, err)
