@@ -473,72 +473,6 @@ func TestRevisionDataHashUsesCollisionCount(t *testing.T) {
 	}
 }
 
-func TestRoleRevisionHashTracksApplicableConfiguration(t *testing.T) {
-	base := revisionTestModelServing(
-		revisionTestRole("prefill", "prefill:v1"),
-		revisionTestRole("decode", "decode:v1"),
-	)
-	base.Spec.Plugins = []workloadv1alpha1.PluginSpec{{
-		Name: "prefill-plugin",
-		Type: workloadv1alpha1.PluginTypeBuiltIn,
-		Scope: &workloadv1alpha1.PluginScope{
-			Roles:  []string{"prefill"},
-			Target: workloadv1alpha1.PluginTargetAll,
-		},
-		Config: &apiextensionsv1.JSON{Raw: []byte(`{"value":1}`)},
-	}}
-
-	hash := func(t *testing.T, ms *workloadv1alpha1.ModelServing, role string) string {
-		t.Helper()
-		got, err := RoleRevisionHash(ms, role)
-		if err != nil {
-			t.Fatalf("RoleRevisionHash(%s) error = %v", role, err)
-		}
-		return got
-	}
-	prefillHash := hash(t, base, "prefill")
-	decodeHash := hash(t, base, "decode")
-
-	operationalChange := base.DeepCopy()
-	operationalChange.Spec.Template.Roles[0].Replicas = ptr.To[int32](9)
-	if got := hash(t, operationalChange, "prefill"); got != prefillHash {
-		t.Fatal("operational replica change affected Role revision hash")
-	}
-
-	otherRoleChange := base.DeepCopy()
-	otherRoleChange.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "prefill:v2"
-	if got := hash(t, otherRoleChange, "decode"); got != decodeHash {
-		t.Fatal("unrelated Role template change affected Role revision hash")
-	}
-
-	scopedPluginChange := base.DeepCopy()
-	scopedPluginChange.Spec.Plugins[0].Config.Raw = []byte(`{"value":2}`)
-	if got := hash(t, scopedPluginChange, "prefill"); got == prefillHash {
-		t.Fatal("applicable plugin change did not affect Role revision hash")
-	}
-	if got := hash(t, scopedPluginChange, "decode"); got != decodeHash {
-		t.Fatal("plugin scoped to another Role affected Role revision hash")
-	}
-
-	expandedPluginScope := base.DeepCopy()
-	expandedPluginScope.Spec.Plugins[0].Scope.Roles = []string{"prefill", "decode"}
-	if got := hash(t, expandedPluginScope, "prefill"); got != prefillHash {
-		t.Fatal("adding another Role to a plugin scope changed the existing Role hash")
-	}
-	if got := hash(t, expandedPluginScope, "decode"); got == decodeHash {
-		t.Fatal("adding a Role to a plugin scope did not affect the newly targeted Role hash")
-	}
-
-	schedulerChange := base.DeepCopy()
-	schedulerChange.Spec.SchedulerName = "other-scheduler"
-	if got := hash(t, schedulerChange, "prefill"); got == prefillHash {
-		t.Fatal("scheduler change did not affect prefill Role revision hash")
-	}
-	if got := hash(t, schedulerChange, "decode"); got == decodeHash {
-		t.Fatal("scheduler change did not affect decode Role revision hash")
-	}
-}
-
 func TestModelServingForControllerRevisionPreservesLegacyOperationalFields(t *testing.T) {
 	legacyRoles := []workloadv1alpha1.Role{
 		revisionTestRole("prefill", "prefill:old"),
@@ -651,13 +585,6 @@ func TestPodRenderingInputsAndHistoricalOwners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hash, err := RoleRevisionHash(ms, "decode")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(hash) != 32 {
-		t.Fatalf("expected 128-bit role digest, got %q", hash)
-	}
 	data, err := BuildRevisionData(ms)
 	if err != nil {
 		t.Fatal(err)
@@ -674,13 +601,6 @@ func TestPodRenderingInputsAndHistoricalOwners(t *testing.T) {
 		t.Fatal("operational state or another role changed rendering inputs")
 	}
 	current.OwnerReferences[0].Name = "new-owner"
-	changedHash, err := RoleRevisionHash(current, "decode")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hash == changedHash {
-		t.Fatal("owner-dependent rendering must change role identity")
-	}
 	cr := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)}, Annotations: map[string]string{ControllerRevisionDataVersionAnnotation: ControllerRevisionDataVersionV1}}, Data: runtime.RawExtension{Raw: data}}
 	restored, err := ApplyRevision(current, cr)
 	if err != nil {

@@ -185,11 +185,16 @@ used by the built-in LWS labels plugin. Legacy snapshots did not record these
 inputs and cannot reproduce values that have since changed.
 
 Upgrading from legacy revision identities to canonical revision history can trigger
-a one-time workload rollout even when the ModelServing spec has not changed. Role
-revision digests also change. Existing partition and availability limits still apply;
+a one-time workload rollout even when the ModelServing spec has not changed.
+Existing partition and availability limits still apply;
 review those limits and available capacity before upgrading. Custom plugins that
 read live operational fields during `OnPodCreate` must adopt the rendering contract
 above.
+
+RoleRollingUpdate continues to compare Role templates using the existing template
+hash. Scheduler and plugin changes are recorded in ModelServing history, but do
+not independently trigger a Role rollout. Canonical Role revision comparisons and
+upgrade compatibility are deferred to follow-up changes.
 
 Revision history limits count unused revisions. Revisions referenced by live Pods,
 current/update status, or incomplete replacements are retained in addition to the

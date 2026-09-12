@@ -15,7 +15,6 @@ package utils
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -61,13 +60,6 @@ type modelServingRevisionRole struct {
 	WorkerTemplate *workloadv1alpha1.PodTemplateSpec `json:"workerTemplate,omitempty"`
 }
 
-type roleRevisionData struct {
-	Metadata      *revisionMetadata             `json:"metadata,omitempty"`
-	SchedulerName string                        `json:"schedulerName"`
-	Plugins       []workloadv1alpha1.PluginSpec `json:"plugins"`
-	Role          modelServingRevisionRole      `json:"role"`
-}
-
 // BuildRevisionData returns the canonical strategic merge patch used as both
 // ControllerRevision data and the primary revision hash input. Only fields that
 // define rendered workloads are included.
@@ -86,53 +78,6 @@ func BuildRevisionData(ms *workloadv1alpha1.ModelServing) ([]byte, error) {
 		return nil, fmt.Errorf("marshal model serving revision data: %w", err)
 	}
 	return data, nil
-}
-
-// RoleRevisionHash identifies the revisioned configuration that can affect a
-// Role's Pods. Plugins scoped exclusively to other Roles are excluded so a
-// RoleRollingUpdate does not restart unrelated Roles.
-func RoleRevisionHash(ms *workloadv1alpha1.ModelServing, roleName string) (string, error) {
-	patch, err := buildRevisionPatch(ms)
-	if err != nil {
-		return "", err
-	}
-	var role *modelServingRevisionRole
-	for i := range patch.Spec.Template.Roles {
-		if patch.Spec.Template.Roles[i].Name == roleName {
-			role = &patch.Spec.Template.Roles[i]
-			break
-		}
-	}
-	if role == nil {
-		return "", fmt.Errorf("role %q not found", roleName)
-	}
-
-	applicablePlugins := make([]workloadv1alpha1.PluginSpec, 0, len(patch.Spec.Plugins))
-	for i := range patch.Spec.Plugins {
-		plugin := patch.Spec.Plugins[i]
-		if pluginAppliesToRole(plugin, *role) {
-			// The per-role hash only describes this role's rendered plugin
-			// behavior. Adding another role to the same scope does not change
-			// what the current role receives, so exclude those names from the
-			// hash input.
-			if plugin.Scope != nil && len(plugin.Scope.Roles) > 0 {
-				plugin.Scope = plugin.Scope.DeepCopy()
-				plugin.Scope.Roles = []string{role.Name}
-			}
-			applicablePlugins = append(applicablePlugins, plugin)
-		}
-	}
-	data, err := json.Marshal(roleRevisionData{
-		Metadata:      patch.Metadata,
-		SchedulerName: patch.Spec.SchedulerName,
-		Plugins:       applicablePlugins,
-		Role:          *role,
-	})
-	if err != nil {
-		return "", fmt.Errorf("marshal role revision data: %w", err)
-	}
-	digest := sha256.Sum256(data)
-	return fmt.Sprintf("%x", digest[:16]), nil
 }
 
 func pluginAppliesToRole(plugin workloadv1alpha1.PluginSpec, role modelServingRevisionRole) bool {
