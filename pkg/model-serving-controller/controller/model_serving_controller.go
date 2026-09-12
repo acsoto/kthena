@@ -1654,8 +1654,9 @@ func (c *ModelServingController) outdatedRoles(ctx context.Context, ms *workload
 
 // roleNeedsUpdate compares a live Role with the canonical revision inputs that
 // apply to that Role. Legacy revisions are always outdated so the one-time v1
-// migration follows the normal rollout strategy; unreadable revisions fall back
-// to the legacy Role hash for compatibility.
+// migration follows the normal rollout strategy. A Role with a revision identity
+// is conservatively outdated when its history cannot be read; the legacy
+// RoleTemplateHash fallback is only used when no revision identity exists.
 func (c *ModelServingController) roleNeedsUpdate(
 	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
@@ -1679,25 +1680,32 @@ func (c *ModelServingController) roleNeedsUpdate(
 	if revision == "" {
 		revision = sg.Revision
 	}
-	if revision != "" && c != nil && c.kubeClientSet != nil {
+	if revision != "" {
+		if c == nil || c.kubeClientSet == nil {
+			return true, nil
+		}
 		cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revision)
 		if err != nil {
 			return false, fmt.Errorf("get ControllerRevision %s: %w", revision, err)
 		}
-		if cr != nil {
-			if cr.Annotations[utils.ControllerRevisionDataVersionAnnotation] == utils.ControllerRevisionDataVersionV1 {
-				historical, err := utils.ModelServingForControllerRevision(ms, cr)
-				if err != nil {
-					return false, fmt.Errorf("apply ControllerRevision %s: %w", cr.Name, err)
-				}
-				observed, err := utils.RoleRevisionHash(historical, targetRole.Name)
-				if err != nil {
-					return false, fmt.Errorf("build revision data for Role %s from ControllerRevision %s: %w", targetRole.Name, cr.Name, err)
-				}
-				return observed != expected, nil
-			}
+		if cr == nil {
+			// A RoleTemplateHash only describes the Role. It cannot prove that
+			// ModelServing-level revisioned inputs (such as schedulerName or
+			// plugins) still match when the referenced history is gone.
 			return true, nil
 		}
+		if cr.Annotations[utils.ControllerRevisionDataVersionAnnotation] == utils.ControllerRevisionDataVersionV1 {
+			historical, err := utils.ModelServingForControllerRevision(ms, cr)
+			if err != nil {
+				return false, fmt.Errorf("apply ControllerRevision %s: %w", cr.Name, err)
+			}
+			observed, err := utils.RoleRevisionHash(historical, targetRole.Name)
+			if err != nil {
+				return false, fmt.Errorf("build revision data for Role %s from ControllerRevision %s: %w", targetRole.Name, cr.Name, err)
+			}
+			return observed != expected, nil
+		}
+		return true, nil
 	}
 
 	observed, ok := c.resolveRoleTemplateHashForComparison(ms, sg, targetRole.Name, role)
@@ -2875,7 +2883,7 @@ func (c *ModelServingController) CreatePodsByRole(ctx context.Context, role work
 	entryPod := utils.GenerateEntryPod(role, ms, servingGroupName, roleID, revision, roleTemplateHash)
 	taskName := c.podGroupManager.GenerateTaskName(role.Name, roleIndex)
 	c.podGroupManager.AnnotatePodWithPodGroup(entryPod, ms, servingGroupName, taskName)
-	if err := c.createPod(ctx, ms, servingGroupName, role.Name, roleID, entryPod, true, chain, "entry"); err != nil {
+	if err := c.createPod(ctx, ms, servingGroupName, role.Name, roleID, revision, roleTemplateHash, entryPod, true, chain, "entry"); err != nil {
 		return err
 	}
 	if role.WorkerReplicas > 0 && role.WorkerTemplate == nil {
@@ -2886,7 +2894,7 @@ func (c *ModelServingController) CreatePodsByRole(ctx context.Context, role work
 	for i := 1; i <= int(role.WorkerReplicas); i++ {
 		workerPod := utils.GenerateWorkerPod(role, ms, entryPod, servingGroupName, roleID, i, revision, roleTemplateHash)
 		c.podGroupManager.AnnotatePodWithPodGroup(workerPod, ms, servingGroupName, taskName)
-		if err := c.createPod(ctx, ms, servingGroupName, role.Name, roleID, workerPod, false, chain, "worker"); err != nil {
+		if err := c.createPod(ctx, ms, servingGroupName, role.Name, roleID, revision, roleTemplateHash, workerPod, false, chain, "worker"); err != nil {
 			return err
 		}
 	}
@@ -2899,6 +2907,8 @@ func (c *ModelServingController) createPod(
 	servingGroupName string,
 	roleName string,
 	roleID string,
+	revision string,
+	roleTemplateHash string,
 	pod *corev1.Pod,
 	isEntry bool,
 	chain *plugins.Chain,
@@ -2917,6 +2927,7 @@ func (c *ModelServingController) createPod(
 			return fmt.Errorf("execute OnPodCreate failed for %s pod %s: %v", roleKind, pod.Name, err)
 		}
 	}
+	utils.RestoreControllerOwnedPodMetadata(pod, ms, servingGroupName, roleName, roleID, isEntry, revision, roleTemplateHash)
 
 	_, err := c.kubeClientSet.CoreV1().Pods(ms.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {

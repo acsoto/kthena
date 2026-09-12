@@ -126,6 +126,50 @@ func GenerateWorkerPod(role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelSer
 	return workerPod
 }
 
+// RestoreControllerOwnedPodMetadata reapplies the controller's authoritative
+// Pod identity after user template metadata and plugins have mutated the Pod.
+// These labels and the ModelServing controller OwnerReference are reserved.
+func RestoreControllerOwnedPodMetadata(
+	pod *corev1.Pod,
+	ms *workloadv1alpha1.ModelServing,
+	groupName, roleName, roleID string,
+	isEntry bool,
+	revision, roleTemplateHash string,
+) {
+	if pod == nil || ms == nil {
+		return
+	}
+	if pod.Labels == nil {
+		pod.Labels = make(map[string]string)
+	}
+	pod.Labels[workloadv1alpha1.ModelServingNameLabelKey] = ms.Name
+	pod.Labels[workloadv1alpha1.GroupNameLabelKey] = groupName
+	pod.Labels[workloadv1alpha1.RoleLabelKey] = roleName
+	pod.Labels[workloadv1alpha1.RoleIDKey] = roleID
+	pod.Labels[workloadv1alpha1.RevisionLabelKey] = revision
+	pod.Labels[workloadv1alpha1.RoleTemplateHashLabelKey] = roleTemplateHash
+	if isEntry {
+		pod.Labels[workloadv1alpha1.EntryLabelKey] = Entry
+	} else {
+		delete(pod.Labels, workloadv1alpha1.EntryLabelKey)
+	}
+
+	controllerRef := newModelServingOwnerRef(ms)
+	ownerReferences := make([]metav1.OwnerReference, 0, len(pod.OwnerReferences)+1)
+	for _, ownerRef := range pod.OwnerReferences {
+		// A Pod can have only one controller. Remove any plugin-supplied
+		// controller and stale ModelServing references before restoring ours.
+		if ownerRef.Controller != nil && *ownerRef.Controller {
+			continue
+		}
+		if ownerRef.APIVersion == controllerRef.APIVersion && ownerRef.Kind == controllerRef.Kind {
+			continue
+		}
+		ownerReferences = append(ownerReferences, ownerRef)
+	}
+	pod.OwnerReferences = append(ownerReferences, controllerRef)
+}
+
 func createBasePod(role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelServing, name, groupName, roleID, revision, roleTemplateHash string) *corev1.Pod {
 	return &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{

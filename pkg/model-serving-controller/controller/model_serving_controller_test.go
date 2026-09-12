@@ -287,7 +287,7 @@ func TestCreatePodAlreadyExistsRequeues(t *testing.T) {
 		},
 	}
 
-	err = controller.createPod(context.Background(), ms, "ms-0", "role", "role-0", newPod, true, nil, "entry")
+	err = controller.createPod(context.Background(), ms, "ms-0", "role", "role-0", utils.ObjectRevision(newPod), utils.ObjectRoleTemplateHash(newPod), newPod, true, nil, "entry")
 	assert.ErrorContains(t, err, "does not match expected identity")
 	h.expectQueuedKey(namespacedKey(ms.Namespace, ms.Name))
 }
@@ -8661,7 +8661,9 @@ func TestRolesToDeleteForRoleRollingUpdate(t *testing.T) {
 	ns := "default"
 	msName := "test-ms"
 	groupName := "test-ms-0"
-	oldRevision := "old-revision"
+	// These cases exercise RoleTemplateHash compatibility without a revision
+	// identity. Missing history for an identified Role is covered separately.
+	oldRevision := ""
 
 	newRole := func(name, image string, replicas int32, maxUnavailable *intstr.IntOrString) workloadv1alpha1.Role {
 		return workloadv1alpha1.Role{
@@ -8855,7 +8857,7 @@ func TestRolesToDeleteForRoleRollingUpdate(t *testing.T) {
 			expectedOutdated: true,
 		},
 		{
-			name: "missing roleTemplateHash without ControllerRevision is skipped",
+			name: "missing revision identity falls back to RoleTemplateHash",
 			roles: []workloadv1alpha1.Role{
 				newRole("prefill", "nginx:latest", 1, nil),
 			},
@@ -9022,7 +9024,9 @@ func TestFindOutdatedRolesInServingGroups(t *testing.T) {
 	ns := "default"
 	msName := "test-ms"
 	newRevision := "new-revision-hash"
-	oldRevision := "old-revision-hash"
+	// These cases exercise the legacy RoleTemplateHash fallback. They have no
+	// revision identity, so a missing ControllerRevision is not involved.
+	oldRevision := ""
 
 	tests := []struct {
 		description              string
@@ -9417,10 +9421,10 @@ func TestFindOutdatedRolesInServingGroups(t *testing.T) {
 	}
 }
 
-func TestFindOutdatedRolesInServingGroups_LegacyMissingRoleTemplateHash(t *testing.T) {
+func TestFindOutdatedRolesInServingGroups_NoRevisionIdentityMissingRoleTemplateHash(t *testing.T) {
 	ns := "default"
 	msName := "test-ms"
-	revision := "same-revision"
+	revision := ""
 	roleName := "prefill"
 
 	ms := &workloadv1alpha1.ModelServing{

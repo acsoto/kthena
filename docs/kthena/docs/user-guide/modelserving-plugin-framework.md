@@ -166,13 +166,12 @@ For more design details, see the [ModelServing Plugin Framework proposal](https:
 
 ## Revision history and upgrades
 
-`OnPodCreate` must render deterministically for a given revision and Pod identity.
-Its `HookRequest.ModelServing` is the ModelServing context used for that Pod. When
-the controller recovers a historical revision, the revisioned spec comes from the
-ControllerRevision while metadata and OwnerReferences remain those of the current
-ModelServing. The complete plugin chain is passed in spec order, and the built-in
-`lws-standard-labels` plugin therefore always uses the current ModelServing owner.
-Treat the ModelServing context as read-only.
+During `OnPodCreate`, the selected revisioned workload configuration is combined
+with the current ModelServing metadata and operational context. When the
+controller recovers a historical revision, metadata and OwnerReferences still
+come from the current ModelServing. The complete plugin chain is passed in spec
+order, and the built-in `lws-standard-labels` plugin therefore uses the current
+ModelServing owner. Treat the ModelServing context as read-only.
 
 Revision history records schedulerName, the complete PluginSpec chain, and Role
 templates. Operational settings such as replica counts and rollout policy remain
