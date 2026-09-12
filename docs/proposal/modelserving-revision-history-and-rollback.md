@@ -20,10 +20,10 @@ rollback. A `ControllerRevision` stores the versioned workload declaration that
 should be restored by rollback. It does not attempt to snapshot every input
 that can affect the final rendered Pod.
 
-Rollback restores the versioned workload declaration, and the controller then
-uses the current operational values and live object context while constructing
-the workload. The proposal does not promise bit-for-bit or field-for-field
-reproduction of the Pod that existed when a revision was created.
+Rollback restores the versioned workload declaration while preserving current
+operational fields and live object metadata such as OwnerReferences. The
+proposal does not promise bit-for-bit or field-for-field reproduction of the
+Pod that existed when a revision was created.
 
 ### Motivation
 
@@ -57,8 +57,6 @@ make a small, explicit revision boundary necessary.
 - A separate rollback state machine.
 - Rollback of an individual Role.
 - Guaranteed CLI rollback to legacy revisions.
-- Runtime implementation changes in this documentation PR; those are reviewed
-  separately in #1767.
 
 ### Proposal
 
@@ -98,8 +96,8 @@ overwritten.
 
 #### Revision Data
 
-`ControllerRevision.Data` contains a deterministic strategic merge patch with
-only explicitly selected workload-definition fields. `BuildRevisionData`
+`ControllerRevision.Data` contains a deterministic serialized projection of the
+revisioned fields. `BuildRevisionData`
 constructs this projection from an allowlist; it must not copy the API object
 and remove known operational fields. API defaults and nil/empty values are
 normalized before serialization.
@@ -297,9 +295,6 @@ distinguished from the legacy wrapped Role list.
 - CLI history and rollback only guarantee revisions in the new format.
 - Legacy revision Data is not rewritten or renumbered and is removed through
   normal history retention once it is no longer live.
-- Built-in plugins should preserve previously supported configuration
-  semantics; incompatible behavior should use an explicit configuration or
-  behavior version.
 
 #### Test Plan
 
