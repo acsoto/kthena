@@ -1655,8 +1655,8 @@ func (c *ModelServingController) outdatedRoles(ctx context.Context, ms *workload
 // roleNeedsUpdate compares a live Role with the canonical revision inputs that
 // apply to that Role. Legacy revisions are always outdated so the one-time v1
 // migration follows the normal rollout strategy. A Role with a revision identity
-// is conservatively outdated when its history cannot be read; the legacy
-// RoleTemplateHash fallback is only used when no revision identity exists.
+// is conservatively outdated when its history cannot be read. Legacy roles use
+// RoleTemplateHash only when it is available; unknown identity is outdated.
 func (c *ModelServingController) roleNeedsUpdate(
 	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
@@ -1665,15 +1665,8 @@ func (c *ModelServingController) roleNeedsUpdate(
 	role datastore.Role,
 ) (bool, error) {
 	expected, err := utils.RoleRevisionHash(ms, targetRole.Name)
-	if err != nil && ms != nil {
-		// Keep this comparison usable for callers that supply a Role separately
-		// from the ModelServing template (for example, during cache recovery).
-		withTarget := ms.DeepCopy()
-		withTarget.Spec.Template.Roles = append(withTarget.Spec.Template.Roles, *targetRole.DeepCopy())
-		expected, err = utils.RoleRevisionHash(withTarget, targetRole.Name)
-	}
 	if err != nil {
-		return false, fmt.Errorf("build desired revision data for role %s: %w", targetRole.Name, err)
+		return false, fmt.Errorf("build desired revision identity for role %s: %w", targetRole.Name, err)
 	}
 
 	revision := role.Revision
@@ -1705,8 +1698,8 @@ func (c *ModelServingController) roleNeedsUpdate(
 	}
 
 	if role.RoleTemplateHash == "" {
-		klog.Warningf("skip outdated check for legacy role %s/%s in ServingGroup %s because its RoleTemplateHash is missing", targetRole.Name, role.Name, sg.Name)
-		return false, nil
+		klog.Warningf("treat legacy role %s/%s in ServingGroup %s as outdated because its identity is missing", targetRole.Name, role.Name, sg.Name)
+		return true, nil
 	}
 	return role.RoleTemplateHash != utils.CalRoleTemplateHash(targetRole), nil
 }
@@ -2302,7 +2295,7 @@ func (c *ModelServingController) UpdateModelServingStatus(ctx context.Context, m
 			// If no groups exist, handle gracefully by setting revisions to the new revision
 			if errors.Is(err, datastore.ErrServingGroupNotFound) {
 				copy := latestMS.DeepCopy()
-				revisionReferences, refsErr := c.revisionReferencesForStatus(ctx, latestMS, nil, modelServingReplicas(latestMS) > 0)
+				revisionReferences, refsErr := c.revisionReferencesForStatus(latestMS, nil, modelServingReplicas(latestMS) > 0)
 				if refsErr != nil {
 					return refsErr
 				}
@@ -2397,7 +2390,7 @@ func (c *ModelServingController) UpdateModelServingStatus(ctx context.Context, m
 		updateRevision := revision
 		var currentRevision string
 		rolloutComplete := updated == replicas && available == replicas && len(groups) == replicas
-		revisionReferences, refsErr := c.revisionReferencesForStatus(ctx, latestMS, groups, progressActive)
+		revisionReferences, refsErr := c.revisionReferencesForStatus(latestMS, groups, progressActive)
 		if refsErr != nil {
 			return refsErr
 		}
@@ -2544,7 +2537,6 @@ func latestCollisionCount(current, desired *int32) *int32 {
 // incomplete, including across Pod deletion and controller restart. A healthy
 // partitioned rollout can release stale references without updating every replica.
 func (c *ModelServingController) revisionReferencesForStatus(
-	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
 	groups []datastore.ServingGroup,
 	retainExisting bool,
@@ -2578,21 +2570,6 @@ func (c *ModelServingController) revisionReferencesForStatus(
 				if role != nil {
 					add(role.Revision)
 				}
-			}
-		}
-	}
-
-	if c.kubeClientSet != nil {
-		// Pod template metadata can overwrite controller labels, so ownership
-		// by ModelServing UID is the only reliable discovery boundary here.
-		pods, err := c.kubeClientSet.CoreV1().Pods(ms.Namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("list Pods for revision references: %w", err)
-		}
-		for i := range pods.Items {
-			pod := &pods.Items[i]
-			if utils.IsOwnedByModelServingWithUID(pod, ms.UID) {
-				add(utils.ObjectRevision(pod))
 			}
 		}
 	}

@@ -3085,6 +3085,7 @@ func TestHasUpdateableOutdatedRole(t *testing.T) {
 	ms := &workloadv1alpha1.ModelServing{
 		Spec: workloadv1alpha1.ModelServingSpec{
 			RolloutStrategy: &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate},
+			Template:        workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{targetRole}},
 		},
 	}
 	newHash := utils.CalRoleTemplateHash(targetRole)
@@ -4672,7 +4673,6 @@ func TestSyncServingGroupReplicasReconcilesHistoricalPodGroupWithHistoricalWorkl
 }
 
 func TestRevisionReferencesForStatusTracksObservedRevisions(t *testing.T) {
-	ctx := context.Background()
 	ms := &workloadv1alpha1.ModelServing{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "default",
@@ -4685,40 +4685,21 @@ func TestRevisionReferencesForStatusTracksObservedRevisions(t *testing.T) {
 			RevisionReferences: []string{"durable-old"},
 		},
 	}
-	kubeClient := kubefake.NewSimpleClientset()
-	controller, err := NewModelServingController(kubeClient, kthenafake.NewSimpleClientset(), nil, apiextfake.NewSimpleClientset())
+	controller, err := NewModelServingController(kubefake.NewSimpleClientset(), kthenafake.NewSimpleClientset(), nil, apiextfake.NewSimpleClientset())
 	require.NoError(t, err)
 
 	key := utils.GetNamespaceName(ms)
 	groupName := utils.GenerateServingGroupName(ms.Name, 0)
 	controller.store.AddServingGroup(key, 0, "group-revision")
 	controller.store.AddRole(key, groupName, "decode", "decode-0", "role-revision", "role-hash")
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: ms.Namespace,
-			Name:      "decode-0",
-			Labels: map[string]string{
-				workloadv1alpha1.RevisionLabelKey: "pod-revision",
-			},
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: workloadv1alpha1.SchemeGroupVersion.String(),
-				Kind:       workloadv1alpha1.ModelServingKind.Kind,
-				Name:       ms.Name,
-				UID:        ms.UID,
-			}},
-		},
-	}
-	_, err = kubeClient.CoreV1().Pods(ms.Namespace).Create(ctx, pod, metav1.CreateOptions{})
-	require.NoError(t, err)
-
 	groups := []datastore.ServingGroup{{Name: groupName, Revision: "group-revision"}}
-	refs, err := controller.revisionReferencesForStatus(ctx, ms, groups, true)
+	refs, err := controller.revisionReferencesForStatus(ms, groups, true)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"durable-old", "group-revision", "pod-revision", "role-revision"}, refs)
+	assert.Equal(t, []string{"durable-old", "group-revision", "role-revision"}, refs)
 
-	refs, err = controller.revisionReferencesForStatus(ctx, ms, groups, false)
+	refs, err = controller.revisionReferencesForStatus(ms, groups, false)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"group-revision", "pod-revision", "role-revision"}, refs)
+	assert.Equal(t, []string{"group-revision", "role-revision"}, refs)
 }
 
 func TestUpdateModelServingStatusRefreshesAfterConflict(t *testing.T) {
@@ -8857,7 +8838,7 @@ func TestRolesToDeleteForRoleRollingUpdate(t *testing.T) {
 			expectedOutdated: true,
 		},
 		{
-			name: "missing revision identity falls back to RoleTemplateHash",
+			name: "missing revision identity and hash is outdated",
 			roles: []workloadv1alpha1.Role{
 				newRole("prefill", "nginx:latest", 1, nil),
 			},
@@ -8866,6 +8847,8 @@ func TestRolesToDeleteForRoleRollingUpdate(t *testing.T) {
 				store.AddServingGroup(utils.GetNamespaceName(ms), 0, oldRevision)
 				addRole(t, store, ms, "prefill", "prefill-0", "", datastore.RoleRunning)
 			},
+			expected:         []roleToDelete{{roleName: "prefill", roleID: "prefill-0"}},
+			expectedOutdated: true,
 		},
 		{
 			name: "partition protects first outdated roles with non-continuous ordinals",
@@ -9421,7 +9404,7 @@ func TestFindOutdatedRolesInServingGroups(t *testing.T) {
 	}
 }
 
-func TestFindOutdatedRolesInServingGroups_NoRevisionIdentityMissingRoleTemplateHash(t *testing.T) {
+func TestFindOutdatedRolesInServingGroups_NoRevisionIdentityMissingRoleTemplateHashIsOutdated(t *testing.T) {
 	ns := "default"
 	msName := "test-ms"
 	revision := ""
@@ -9456,7 +9439,7 @@ func TestFindOutdatedRolesInServingGroups_NoRevisionIdentityMissingRoleTemplateH
 	controller := &ModelServingController{store: store}
 	result := controller.findOutdatedRolesInServingGroups(ms, []datastore.ServingGroup{{Name: "test-ms-0", Revision: revision, Status: datastore.ServingGroupRunning}}, revision)
 
-	assert.Empty(t, result, "legacy role with missing roleTemplateHash should not be treated as outdated by default")
+	assert.Equal(t, map[string][]string{"test-ms-0": {roleName}}, result)
 }
 
 func TestResolveRoleTemplateHash_UsesPodRevisionControllerRevision(t *testing.T) {

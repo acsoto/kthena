@@ -138,9 +138,12 @@ func TestCreatePodRestoresReservedMetadataAfterTemplateAndPlugin(t *testing.T) {
 	assert.Equal(t, ms.UID, owner.UID)
 
 	controller.store = datastore.New()
-	references, err := controller.revisionReferencesForStatus(ctx, ms, nil, false)
+	key := utils.GetNamespaceName(ms)
+	controller.store.AddServingGroup(key, 0, revision)
+	controller.store.AddRole(key, groupName, roleName, roleID, revision, roleTemplateHash)
+	references, err := controller.revisionReferencesForStatus(ms, []datastore.ServingGroup{{Name: groupName, Revision: revision}}, false)
 	require.NoError(t, err)
-	require.Equal(t, []string{revision}, references, "revision refresh must observe the authoritative Pod identity")
+	require.Equal(t, []string{revision}, references, "revision refresh must observe the observed Role identity")
 	ms.Status.RevisionReferences = references
 
 	_, err = utils.CreateControllerRevision(ctx, kubeClient, ms, revision, []workloadv1alpha1.Role{role})
