@@ -98,6 +98,75 @@ func TestBuildRevisionDataCanonicalSemantics(t *testing.T) {
 	}
 }
 
+func TestBuildRevisionDataIgnoresOwnerReferences(t *testing.T) {
+	base := revisionTestModelServing(revisionTestRole("decode", "decode:v1"))
+	base.OwnerReferences = []metav1.OwnerReference{{Kind: "LeaderWorkerSet", Name: "old", UID: "old"}}
+	changed := base.DeepCopy()
+	changed.OwnerReferences = []metav1.OwnerReference{{Kind: "Deployment", Name: "new", UID: "new"}}
+
+	baseData, err := BuildRevisionData(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedData, err := BuildRevisionData(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(baseData, changedData) {
+		t.Fatalf("owner references changed revision data:\nbase: %s\nchanged: %s", baseData, changedData)
+	}
+}
+
+func TestRoleRevisionHashUsesApplicableCanonicalInputs(t *testing.T) {
+	ms := revisionTestModelServing(
+		revisionTestRole("decode", "decode:v1"),
+		revisionTestRole("prefill", "prefill:v1"),
+	)
+	ms.Spec.Template.Roles[0].WorkerReplicas = 0
+	ms.Spec.Template.Roles[0].WorkerTemplate = nil
+	ms.Spec.Plugins = []workloadv1alpha1.PluginSpec{
+		{Name: "global", Type: workloadv1alpha1.PluginTypeBuiltIn},
+		{Name: "worker", Scope: &workloadv1alpha1.PluginScope{Target: workloadv1alpha1.PluginTargetWorker}},
+		{Name: "decode", Scope: &workloadv1alpha1.PluginScope{Roles: []string{"decode"}}, Config: &apiextensionsv1.JSON{Raw: []byte(`{"z":1,"a":2}`)}},
+	}
+	base, err := RoleRevisionHash(ms, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	operational := ms.DeepCopy()
+	operational.Spec.Replicas = ptr.To[int32](8)
+	operational.Spec.RecoveryPolicy = workloadv1alpha1.NoneRestartPolicy
+	operational.Spec.Template.Roles[0].Replicas = ptr.To[int32](7)
+	operational.Spec.Template.Roles[1].EntryTemplate.Spec.Containers[0].Image = "prefill:v2"
+	got, err := RoleRevisionHash(operational, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != base {
+		t.Fatal("operational fields or another Role changed decode revision hash")
+	}
+
+	changed := ms.DeepCopy()
+	changed.Spec.Plugins[2].Config = &apiextensionsv1.JSON{Raw: []byte(`{"a":3,"z":1}`)}
+	changedHash, err := RoleRevisionHash(changed, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedHash == base {
+		t.Fatal("applicable plugin config did not change decode revision hash")
+	}
+
+	changed = ms.DeepCopy()
+	changed.Spec.Plugins[0], changed.Spec.Plugins[2] = changed.Spec.Plugins[2], changed.Spec.Plugins[0]
+	changedHash, err = RoleRevisionHash(changed, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedHash == base {
+		t.Fatal("applicable plugin order did not change decode revision hash")
+	}
+}
+
 func TestBuildRevisionDataDeduplicatesPluginScopeRoles(t *testing.T) {
 	base := revisionTestModelServing(revisionTestRole("prefill", "prefill:v1"))
 	base.Spec.Plugins = []workloadv1alpha1.PluginSpec{{
@@ -336,6 +405,7 @@ func TestApplyRevisionPreservesOperationalFields(t *testing.T) {
 		revisionTestRole("removed", "removed:current"),
 	)
 	current.ObjectMeta = metav1.ObjectMeta{Name: "test-ms", Namespace: "default", UID: "test-uid"}
+	current.OwnerReferences = []metav1.OwnerReference{{Kind: "LeaderWorkerSet", Name: "current-owner", UID: "current-owner"}}
 	current.Spec.Replicas = ptr.To[int32](4)
 	current.Spec.RecoveryPolicy = workloadv1alpha1.NoneRestartPolicy
 	current.Spec.Template.RestartGracePeriodSeconds = ptr.To[int64](20)
@@ -381,6 +451,16 @@ func TestApplyRevisionPreservesOperationalFields(t *testing.T) {
 	}
 	if got := *applied.Spec.Replicas; got != 4 {
 		t.Errorf("replicas = %d, want 4", got)
+	}
+	if !reflect.DeepEqual(applied.OwnerReferences, current.OwnerReferences) {
+		t.Fatal("ApplyRevision changed current ModelServing ownership")
+	}
+	recovered, err := ModelServingForControllerRevision(current, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(recovered.OwnerReferences, current.OwnerReferences) {
+		t.Fatal("ModelServingForControllerRevision changed current ModelServing ownership")
 	}
 	if got := applied.Spec.RecoveryPolicy; got != workloadv1alpha1.NoneRestartPolicy {
 		t.Errorf("recoveryPolicy = %q, want %q", got, workloadv1alpha1.NoneRestartPolicy)
@@ -583,83 +663,5 @@ func revisionTestRole(name, image string) workloadv1alpha1.Role {
 				Containers: []corev1.Container{{Name: name + "-worker", Image: image}},
 			},
 		},
-	}
-}
-
-func TestPodRenderingInputsAndHistoricalOwners(t *testing.T) {
-	ms := revisionTestModelServing(revisionTestRole("decode", "decode:v1"), revisionTestRole("prefill", "prefill:v1"))
-	ms.OwnerReferences = []metav1.OwnerReference{{Kind: "LeaderWorkerSet", Name: "old-owner", UID: "old-owner"}}
-	before, err := PodRenderingModelServing(ms, "decode")
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := BuildRevisionData(ms)
-	if err != nil {
-		t.Fatal(err)
-	}
-	current := ms.DeepCopy()
-	current.Spec.Replicas = ptr.To[int32](9)
-	current.Labels = map[string]string{"mutable": "value"}
-	current.Spec.Template.Roles[1].EntryTemplate.Spec.Containers[0].Image = "prefill:v2"
-	after, err := PodRenderingModelServing(current, "decode")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(before, after) {
-		t.Fatal("operational state or another role changed rendering inputs")
-	}
-	current.OwnerReferences[0].Name = "new-owner"
-	cr := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)}, Annotations: map[string]string{ControllerRevisionDataVersionAnnotation: ControllerRevisionDataVersionV1}}, Data: runtime.RawExtension{Raw: data}}
-	restored, err := ApplyRevision(current, cr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(current.OwnerReferences, restored.OwnerReferences) {
-		t.Fatal("applying a revision changed the live ModelServing ownership")
-	}
-	restored, err = ModelServingForControllerRevision(current, cr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	historical, err := PodRenderingModelServing(restored, "decode")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(before, historical) {
-		t.Fatal("historical rendering did not restore owner dependencies")
-	}
-}
-
-func TestRevisionOwnerReferenceOrderIsCanonical(t *testing.T) {
-	ms := &workloadv1alpha1.ModelServing{
-		ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{
-			{APIVersion: "apps/v1", Kind: "Deployment", Name: "second", UID: "b"},
-			{APIVersion: "apps/v1", Kind: "Deployment", Name: "first", UID: "a", BlockOwnerDeletion: ptr.To(true)},
-		}},
-		Spec: workloadv1alpha1.ModelServingSpec{Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{revisionTestRole("decode", "image:v1")}}},
-	}
-	before := ms.DeepCopy()
-	a, err := BuildRevisionData(ms)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(ms, before) {
-		t.Fatal("canonicalization mutated input")
-	}
-	ms.OwnerReferences[0], ms.OwnerReferences[1] = ms.OwnerReferences[1], ms.OwnerReferences[0]
-	b, err := BuildRevisionData(ms)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(a, b) {
-		t.Fatal("owner order changed revision data")
-	}
-	ms.OwnerReferences[0].BlockOwnerDeletion = ptr.To(false)
-	c, err := BuildRevisionData(ms)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(a, c) {
-		t.Fatal("garbage collection flags changed workload identity")
 	}
 }

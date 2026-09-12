@@ -26,11 +26,8 @@ import (
 
 // HookRequest carries the context for plugin hook invocations.
 type HookRequest struct {
-	// During OnPodCreate, ModelServing contains only object identity and canonical
-	// revision inputs for this Role. Status, operational fields and other Roles
-	// are unavailable. Owner references contain historical identity fields only,
-	// without garbage-collection flags. Plugins must not use external mutable
-	// state to render Pods.
+	// ModelServing is the current workload context used for Pod rendering,
+	// including its current metadata and ownership.
 	ModelServing *workloadv1alpha1.ModelServing
 	ServingGroup string
 	RoleName     string

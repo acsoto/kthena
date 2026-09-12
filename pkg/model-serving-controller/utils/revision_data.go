@@ -35,17 +35,7 @@ import (
 const defaultSchedulerName = "volcano"
 
 type modelServingRevisionPatch struct {
-	Spec      modelServingRevisionSpec `json:"spec"`
-	Rendering *revisionRenderingData   `json:"rendering,omitempty"`
-	// Metadata keeps snapshots written by the initial v1 implementation readable.
-	// New snapshots use Rendering so the data cannot be mistaken for API metadata.
-	Metadata *revisionRenderingData `json:"metadata,omitempty"`
-}
-
-// revisionRenderingData is snapshot-only context, not ModelServing metadata.
-// It must never be applied to the live object by rollback.
-type revisionRenderingData struct {
-	OwnerReferences []metav1.OwnerReference `json:"ownerReferences"`
+	Spec modelServingRevisionSpec `json:"spec"`
 }
 
 type modelServingRevisionSpec struct {
@@ -65,10 +55,14 @@ type modelServingRevisionRole struct {
 	WorkerTemplate *workloadv1alpha1.PodTemplateSpec `json:"workerTemplate,omitempty"`
 }
 
-// BuildRevisionData returns the canonical spec patch and snapshot-only rendering
-// context used as ControllerRevision data and the primary revision hash input.
-// Only fields that define rendered workloads are included. ApplyRevision applies
-// the spec patch without restoring object ownership from rendering context.
+type modelServingRoleRevisionProjection struct {
+	SchedulerName string                        `json:"schedulerName"`
+	Plugins       []workloadv1alpha1.PluginSpec `json:"plugins"`
+	Role          modelServingRevisionRole      `json:"role"`
+}
+
+// BuildRevisionData returns the canonical spec patch used as ControllerRevision
+// data and the primary revision hash input.
 func BuildRevisionData(ms *workloadv1alpha1.ModelServing) ([]byte, error) {
 	if ms == nil {
 		return nil, fmt.Errorf("model serving is nil")
@@ -84,6 +78,48 @@ func BuildRevisionData(ms *workloadv1alpha1.ModelServing) ([]byte, error) {
 		return nil, fmt.Errorf("marshal model serving revision data: %w", err)
 	}
 	return data, nil
+}
+
+// BuildRoleRevisionData returns the canonical revision projection applicable to
+// one Role. It is derived from the same normalized data as BuildRevisionData,
+// preserving plugin order and the complete PluginSpec for each applicable hook.
+func BuildRoleRevisionData(ms *workloadv1alpha1.ModelServing, roleName string) ([]byte, error) {
+	patch, err := buildRevisionPatch(ms)
+	if err != nil {
+		return nil, err
+	}
+	for _, role := range patch.Spec.Template.Roles {
+		if role.Name != roleName {
+			continue
+		}
+		plugins := make([]workloadv1alpha1.PluginSpec, 0, len(patch.Spec.Plugins))
+		for _, plugin := range patch.Spec.Plugins {
+			if pluginAppliesToRole(plugin, role) {
+				plugins = append(plugins, plugin)
+			}
+		}
+		projection := modelServingRoleRevisionProjection{
+			SchedulerName: patch.Spec.SchedulerName,
+			Plugins:       plugins,
+			Role:          role,
+		}
+		data, err := json.Marshal(projection)
+		if err != nil {
+			return nil, fmt.Errorf("marshal Role %q revision data: %w", roleName, err)
+		}
+		return data, nil
+	}
+	return nil, fmt.Errorf("role %q not found", roleName)
+}
+
+// RoleRevisionHash returns the hash of the canonical revision inputs that
+// apply to one Role.
+func RoleRevisionHash(ms *workloadv1alpha1.ModelServing, roleName string) (string, error) {
+	data, err := BuildRoleRevisionData(ms, roleName)
+	if err != nil {
+		return "", err
+	}
+	return RevisionDataHash(data, nil), nil
 }
 
 func pluginAppliesToRole(plugin workloadv1alpha1.PluginSpec, role modelServingRevisionRole) bool {
@@ -155,22 +191,7 @@ func buildRevisionPatch(ms *workloadv1alpha1.ModelServing) (*modelServingRevisio
 		return roles[i].Name < roles[j].Name
 	})
 
-	var rendering *revisionRenderingData
-	if len(normalized.OwnerReferences) > 0 {
-		for i := range normalized.OwnerReferences {
-			// Ownership flags control garbage collection, not Pod rendering.
-			normalized.OwnerReferences[i].Controller = nil
-			normalized.OwnerReferences[i].BlockOwnerDeletion = nil
-		}
-		sort.Slice(normalized.OwnerReferences, func(i, j int) bool {
-			a, _ := json.Marshal(normalized.OwnerReferences[i])
-			b, _ := json.Marshal(normalized.OwnerReferences[j])
-			return bytes.Compare(a, b) < 0
-		})
-		rendering = &revisionRenderingData{OwnerReferences: normalized.OwnerReferences}
-	}
 	return &modelServingRevisionPatch{
-		Rendering: rendering,
 		Spec: modelServingRevisionSpec{
 			SchedulerName: normalized.Spec.SchedulerName,
 			Plugins:       plugins,
@@ -306,21 +327,7 @@ func ModelServingForControllerRevision(ms *workloadv1alpha1.ModelServing, cr *ap
 		return nil, fmt.Errorf("controller revision or its data is nil")
 	}
 	if cr.Annotations[ControllerRevisionDataVersionAnnotation] == ControllerRevisionDataVersionV1 {
-		result, err := ApplyRevision(ms, cr)
-		if err != nil {
-			return nil, err
-		}
-		patch, err := decodeRevisionPatch(cr.Data.Raw)
-		if err != nil {
-			return nil, err
-		}
-		// This object is a rendering context, never an API update payload.
-		// Applying a revision to the real ModelServing must preserve ownership.
-		result.OwnerReferences = nil
-		if rendering := patch.renderingData(); rendering != nil {
-			result.OwnerReferences = rendering.OwnerReferences
-		}
-		return result, nil
+		return ApplyRevision(ms, cr)
 	}
 	if !metav1.IsControlledBy(cr, ms) {
 		return nil, fmt.Errorf("controller revision %q is not controlled by ModelServing %s/%s", cr.Name, ms.Namespace, ms.Name)
@@ -380,13 +387,6 @@ func decodeRevisionPatch(data []byte) (*modelServingRevisionPatch, error) {
 	return &patch, nil
 }
 
-func (p *modelServingRevisionPatch) renderingData() *revisionRenderingData {
-	if p.Rendering != nil {
-		return p.Rendering
-	}
-	return p.Metadata
-}
-
 func revisionRole(source modelServingRevisionRole) workloadv1alpha1.Role {
 	role := workloadv1alpha1.Role{}
 	applyRevisionRole(&role, source)
@@ -404,37 +404,4 @@ func applyRevisionRole(target *workloadv1alpha1.Role, source modelServingRevisio
 	} else {
 		target.WorkerTemplate = source.WorkerTemplate.DeepCopy()
 	}
-}
-
-// PodRenderingModelServing supplies only identity and canonical, role-scoped
-// revision inputs to Pod creation plugins. Operational state must not affect
-// rendered Pods, and another Role's configuration must not affect this Role.
-func PodRenderingModelServing(ms *workloadv1alpha1.ModelServing, roleName string) (*workloadv1alpha1.ModelServing, error) {
-	patch, err := buildRevisionPatch(ms)
-	if err != nil {
-		return nil, err
-	}
-	result := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: ms.Name, Namespace: ms.Namespace, UID: ms.UID}}
-	if rendering := patch.renderingData(); rendering != nil {
-		result.OwnerReferences = rendering.OwnerReferences
-	}
-	result.Spec.SchedulerName = patch.Spec.SchedulerName
-	for _, role := range patch.Spec.Template.Roles {
-		if role.Name != roleName {
-			continue
-		}
-		result.Spec.Template.Roles = []workloadv1alpha1.Role{revisionRole(role)}
-		for _, plugin := range patch.Spec.Plugins {
-			if !pluginAppliesToRole(plugin, role) {
-				continue
-			}
-			if plugin.Scope != nil && len(plugin.Scope.Roles) > 0 {
-				plugin.Scope = plugin.Scope.DeepCopy()
-				plugin.Scope.Roles = []string{roleName}
-			}
-			result.Spec.Plugins = append(result.Spec.Plugins, plugin)
-		}
-		return result, nil
-	}
-	return nil, fmt.Errorf("role %q not found", roleName)
 }

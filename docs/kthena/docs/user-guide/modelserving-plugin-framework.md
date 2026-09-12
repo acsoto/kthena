@@ -167,24 +167,17 @@ For more design details, see the [ModelServing Plugin Framework proposal](https:
 ## Revision history and upgrades
 
 `OnPodCreate` must render deterministically for a given revision and Pod identity.
-Its `HookRequest.ModelServing` contains the ModelServing name, namespace and UID,
-historical owner identities (API version, kind, name and UID), canonical scheduler configuration, the current Role's
-revisioned template and applicable plugin configuration. It does not expose status,
-ModelServing labels or annotations, rollout policy, replica counts from the live
-object, or other Roles. The Role replica count is fixed at one in this rendering
-context; worker replicas remain part of the revision. Plugin factories receive
-canonical configuration scoped to the Role as well. Treat the ModelServing
-context as read-only. Garbage-collection flags (`controller` and
-`blockOwnerDeletion`) are not rendering inputs. Plugins must not derive workload configuration from
-controller revision labels or operational PodGroup annotations on the Pod; those
-are controller bookkeeping and can change independently of a Role revision.
+Its `HookRequest.ModelServing` is the ModelServing context used for that Pod. When
+the controller recovers a historical revision, the revisioned spec comes from the
+ControllerRevision while metadata and OwnerReferences remain those of the current
+ModelServing. The complete plugin chain is passed in spec order, and the built-in
+`lws-standard-labels` plugin therefore always uses the current ModelServing owner.
+Treat the ModelServing context as read-only.
 
-Move any Pod-rendering dependency on operational fields or external mutable state
-into `spec.plugins[].config` or the Role's Pod template. `OnPodReady` still receives
-the live ModelServing for observation. Historical recovery restores owner identities
-used by the built-in LWS labels plugin only in the rendering context; applying a
-revision to a ModelServing preserves its live owner references. Legacy snapshots did not record these
-inputs and cannot reproduce values that have since changed.
+Revision history records schedulerName, the complete PluginSpec chain, and Role
+templates. Operational settings such as replica counts and rollout policy remain
+current while a historical workload is recovered. Legacy snapshots did not record
+the newer revisioned inputs and are migrated through the normal rollout strategy.
 
 Upgrading from legacy revision identities to canonical revision history can trigger
 a one-time workload rollout even when the ModelServing spec has not changed.
@@ -194,12 +187,11 @@ read live operational fields during `OnPodCreate` must adopt the rendering contr
 above.
 
 Both rollout strategies compare the applicable revisioned inputs using the same
-canonical rendering semantics as revision history. Under RoleRollingUpdate, a
-Role is outdated when its role-scoped rendering inputs differ, so scheduler and
-applicable plugin changes trigger Role replacement as required. Operational
-fields do not trigger replacement. When a legacy revision is first reconciled
-after upgrade, it is migrated through the selected rollout strategy once, even
-if the rendered inputs are otherwise unchanged.
+canonical serialization as revision history. Under RoleRollingUpdate, a Role is
+outdated when its scheduler, applicable plugin chain, or Role template differs.
+Operational fields do not trigger replacement. When a legacy revision is first
+reconciled after upgrade, it is migrated through the selected rollout strategy
+once, even if the rendered inputs are otherwise unchanged.
 
 Revision history limits count unused revisions. Revisions referenced by live Pods,
 current/update status, or incomplete replacements are retained in addition to the

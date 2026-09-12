@@ -82,13 +82,3 @@ func TestHistoricalWorkerRecoveryPreservesSurvivingEntry(t *testing.T) {
 		require.Equal(t, hash, utils.ObjectRoleTemplateHash(&pod))
 	}
 }
-
-func TestOwnerOnlyUpdateEnqueuesModelServing(t *testing.T) {
-	c, err := NewModelServingController(kubefake.NewSimpleClientset(), kthenafake.NewSimpleClientset(), nil, apiextfake.NewSimpleClientset())
-	require.NoError(t, err)
-	old := recoveryModelServing()
-	current := old.DeepCopy()
-	current.OwnerReferences = []metav1.OwnerReference{{Kind: "LeaderWorkerSet", Name: "owner", UID: "owner"}}
-	c.updateModelServing(old, current)
-	require.Equal(t, 1, c.workqueue.Len())
-}

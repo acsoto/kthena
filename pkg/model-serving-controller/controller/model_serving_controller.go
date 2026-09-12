@@ -284,7 +284,7 @@ func (c *ModelServingController) updateModelServing(old, cur interface{}) {
 		return
 	}
 
-	if reflect.DeepEqual(oldms.Spec, curms.Spec) && reflect.DeepEqual(oldms.OwnerReferences, curms.OwnerReferences) {
+	if reflect.DeepEqual(oldms.Spec, curms.Spec) {
 		// Status-only changes do not require reconciliation.
 		klog.V(4).InfoS("Workload inputs have not changed, skipping update", "modelServing", klog.KObj(curms))
 		return
@@ -1652,10 +1652,10 @@ func (c *ModelServingController) outdatedRoles(ctx context.Context, ms *workload
 	return outdatedRoles, newUnavailable, nil
 }
 
-// roleNeedsUpdate compares a live Role with the revisioned inputs that apply to
-// that Role. V1 revisions use the same canonical rendering projection as the
-// revision hash; legacy revisions are always outdated during the first v1
-// reconciliation so migration follows the normal rollout strategy.
+// roleNeedsUpdate compares a live Role with the canonical revision inputs that
+// apply to that Role. Legacy revisions are always outdated so the one-time v1
+// migration follows the normal rollout strategy; unreadable revisions fall back
+// to the legacy Role hash for compatibility.
 func (c *ModelServingController) roleNeedsUpdate(
 	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
@@ -1663,47 +1663,49 @@ func (c *ModelServingController) roleNeedsUpdate(
 	targetRole workloadv1alpha1.Role,
 	role datastore.Role,
 ) (bool, error) {
-	if role.Revision == "" || c.kubeClientSet == nil {
-		observedHash, ok := c.resolveRoleTemplateHashForComparison(ms, sg, targetRole.Name, role)
-		if !ok {
-			klog.Warningf("skip outdated check for role %s/%s in ServingGroup %s because roleTemplateHash is missing and cannot be inferred", targetRole.Name, role.Name, sg.Name)
-			return false, nil
-		}
-		return observedHash != utils.CalRoleTemplateHash(targetRole), nil
+	expected, err := utils.RoleRevisionHash(ms, targetRole.Name)
+	if err != nil && ms != nil {
+		// Keep this comparison usable for callers that supply a Role separately
+		// from the ModelServing template (for example, during cache recovery).
+		withTarget := ms.DeepCopy()
+		withTarget.Spec.Template.Roles = append(withTarget.Spec.Template.Roles, *targetRole.DeepCopy())
+		expected, err = utils.RoleRevisionHash(withTarget, targetRole.Name)
+	}
+	if err != nil {
+		return false, fmt.Errorf("build desired revision data for role %s: %w", targetRole.Name, err)
 	}
 
-	cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, role.Revision)
-	if err != nil {
-		return false, fmt.Errorf("get ControllerRevision %s: %w", role.Revision, err)
+	revision := role.Revision
+	if revision == "" {
+		revision = sg.Revision
 	}
-	if cr == nil {
-		// Keep compatibility with pre-existing cache entries that do not have a
-		// readable snapshot. The revision will still be compared by the legacy
-		// Role hash when one is available.
-		observedHash, ok := c.resolveRoleTemplateHashForComparison(ms, sg, targetRole.Name, role)
-		if !ok {
-			klog.Warningf("skip outdated check for role %s/%s in ServingGroup %s because ControllerRevision %s is missing and roleTemplateHash cannot be inferred", targetRole.Name, role.Name, sg.Name, role.Revision)
-			return false, nil
+	if revision != "" && c != nil && c.kubeClientSet != nil {
+		cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revision)
+		if err != nil {
+			return false, fmt.Errorf("get ControllerRevision %s: %w", revision, err)
 		}
-		return observedHash != utils.CalRoleTemplateHash(targetRole), nil
-	}
-	if cr.Annotations[utils.ControllerRevisionDataVersionAnnotation] != utils.ControllerRevisionDataVersionV1 {
-		return true, nil
+		if cr != nil {
+			if cr.Annotations[utils.ControllerRevisionDataVersionAnnotation] == utils.ControllerRevisionDataVersionV1 {
+				historical, err := utils.ModelServingForControllerRevision(ms, cr)
+				if err != nil {
+					return false, fmt.Errorf("apply ControllerRevision %s: %w", cr.Name, err)
+				}
+				observed, err := utils.RoleRevisionHash(historical, targetRole.Name)
+				if err != nil {
+					return false, fmt.Errorf("build revision data for Role %s from ControllerRevision %s: %w", targetRole.Name, cr.Name, err)
+				}
+				return observed != expected, nil
+			}
+			return true, nil
+		}
 	}
 
-	historical, err := utils.ModelServingForControllerRevision(ms, cr)
-	if err != nil {
-		return false, fmt.Errorf("apply ControllerRevision %s: %w", cr.Name, err)
+	observed, ok := c.resolveRoleTemplateHashForComparison(ms, sg, targetRole.Name, role)
+	if !ok {
+		klog.Warningf("skip outdated check for role %s/%s in ServingGroup %s because its revision data cannot be inferred", targetRole.Name, role.Name, sg.Name)
+		return false, nil
 	}
-	observed, err := utils.PodRenderingModelServing(historical, targetRole.Name)
-	if err != nil {
-		return false, fmt.Errorf("build historical rendering context for role %s: %w", targetRole.Name, err)
-	}
-	desired, err := utils.PodRenderingModelServing(ms, targetRole.Name)
-	if err != nil {
-		return false, fmt.Errorf("build desired rendering context for role %s: %w", targetRole.Name, err)
-	}
-	return !reflect.DeepEqual(observed, desired), nil
+	return observed != utils.CalRoleTemplateHash(targetRole), nil
 }
 
 func selectOutdatedRolesToDelete(roleName string, outdatedRoles []datastore.Role, maxScaleDown int) ([]roleToDelete, error) {
@@ -2865,12 +2867,7 @@ func (c *ModelServingController) CreatePodsForServingGroup(ctx context.Context, 
 
 func (c *ModelServingController) CreatePodsByRole(ctx context.Context, role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelServing, roleIndex int, servingGroupOrdinal int, revision string, roleTemplateHash string) error {
 	servingGroupName := utils.GenerateServingGroupName(ms.Name, servingGroupOrdinal)
-	// Build factories with the same role-scoped input used by Pod hooks.
-	renderingMS, err := utils.PodRenderingModelServing(ms, role.Name)
-	if err != nil {
-		return err
-	}
-	chain, err := c.buildPluginChain(renderingMS)
+	chain, err := c.buildPluginChain(ms)
 	if err != nil {
 		return fmt.Errorf("build plugin chain: %w", err)
 	}
@@ -2908,12 +2905,8 @@ func (c *ModelServingController) createPod(
 	roleKind string,
 ) error {
 	if chain != nil {
-		renderingMS, err := utils.PodRenderingModelServing(ms, roleName)
-		if err != nil {
-			return err
-		}
 		req := &plugins.HookRequest{
-			ModelServing: renderingMS,
+			ModelServing: ms,
 			ServingGroup: servingGroupName,
 			RoleName:     roleName,
 			RoleID:       roleID,
