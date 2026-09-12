@@ -83,9 +83,8 @@ func RecordModelServingRevision(
 			}
 		}
 	}
-
 	if latest != nil && equivalent != nil && latest.Name == equivalent.Name {
-		return latest.DeepCopy(), modelServingCollisionCount(ms), nil
+		return equivalent, modelServingCollisionCount(ms), nil
 	}
 	nextRevision := maxRevision + 1
 

@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -401,14 +402,11 @@ func TestApplyRevisionPreservesOperationalFields(t *testing.T) {
 	if got := *applied.Spec.Template.Roles[1].Replicas; got != 3 {
 		t.Errorf("prefill replicas = %d, want 3", got)
 	}
-	if got := *applied.Spec.Template.Roles[2].Replicas; got != 1 {
-		t.Errorf("restored replicas = %d, want 1", got)
-	}
 	if applied.Spec.Template.Roles[0].MaxUnavailable == nil || applied.Spec.Template.Roles[1].MaxUnavailable == nil {
 		t.Error("rolling update configuration was not preserved for existing roles")
 	}
-	if applied.Spec.Template.Roles[2].MaxUnavailable != nil {
-		t.Error("restored role inherited rolling update configuration")
+	if applied.Spec.Template.Roles[2].Replicas == nil || *applied.Spec.Template.Roles[2].Replicas != 1 {
+		t.Errorf("historical-only v1 Role replicas = %v, want API default 1", applied.Spec.Template.Roles[2].Replicas)
 	}
 	if len(applied.Spec.Template.Roles) != 3 {
 		t.Fatalf("roles = %d, want 3", len(applied.Spec.Template.Roles))
@@ -475,6 +473,77 @@ func TestRevisionDataHashUsesCollisionCount(t *testing.T) {
 	}
 }
 
+func TestModelServingForControllerRevisionPreservesLegacyOperationalFields(t *testing.T) {
+	legacyRoles := []workloadv1alpha1.Role{
+		revisionTestRole("prefill", "prefill:old"),
+		revisionTestRole("restored", "restored:old"),
+	}
+	legacyRoles[0].Replicas = ptr.To[int32](2)
+	legacyRoles[1].Replicas = ptr.To[int32](4)
+	legacyRoles[0].RollingUpdateConfiguration.MaxUnavailable = ptr.To(intstr.FromInt(2))
+	data, err := json.Marshal(map[string]interface{}{"data": legacyRoles})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := revisionTestModelServing(revisionTestRole("prefill", "prefill:new"))
+	current.ObjectMeta = metav1.ObjectMeta{Name: "test-ms", Namespace: "default", UID: "test-uid"}
+	current.Spec.SchedulerName = "current-scheduler"
+	current.Spec.Plugins = []workloadv1alpha1.PluginSpec{{Name: "current-plugin", Type: workloadv1alpha1.PluginTypeBuiltIn}}
+	current.Spec.Template.Roles[0].Replicas = ptr.To[int32](5)
+	current.Spec.Template.Roles[0].RollingUpdateConfiguration.Partition = ptr.To(intstr.FromInt(1))
+	cr := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(current)}},
+		Data:       runtime.RawExtension{Raw: data},
+	}
+
+	got, err := ModelServingForControllerRevision(current, cr)
+	if err != nil {
+		t.Fatalf("ModelServingForControllerRevision() error = %v", err)
+	}
+	if got.Spec.SchedulerName != "current-scheduler" || len(got.Spec.Plugins) != 1 || got.Spec.Plugins[0].Name != "current-plugin" {
+		t.Fatal("legacy revision changed fields that it never recorded")
+	}
+	if got.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image != "prefill:old" {
+		t.Fatal("legacy Role template was not restored")
+	}
+	if got.Spec.Template.Roles[0].Replicas == nil || *got.Spec.Template.Roles[0].Replicas != 5 {
+		t.Fatal("current Role replicas were not preserved")
+	}
+	if got.Spec.Template.Roles[0].Partition == nil || got.Spec.Template.Roles[0].Partition.IntValue() != 1 {
+		t.Fatal("current Role rollout configuration was not preserved")
+	}
+	if len(got.Spec.Template.Roles) != 2 {
+		t.Fatalf("legacy revision restored %d roles, want the historical-only role with its stored count", len(got.Spec.Template.Roles))
+	}
+	if got.Spec.Template.Roles[1].Replicas == nil || *got.Spec.Template.Roles[1].Replicas != 4 {
+		t.Fatal("historical-only legacy Role did not preserve its stored replica count")
+	}
+}
+
+func TestModelServingForControllerRevisionRejectsForeignLegacyRevision(t *testing.T) {
+	current := revisionTestModelServing(revisionTestRole("prefill", "prefill:new"))
+	current.ObjectMeta = metav1.ObjectMeta{Name: "test-ms", Namespace: "default", UID: "test-uid"}
+	data, err := json.Marshal(map[string]interface{}{
+		"data": []workloadv1alpha1.Role{revisionTestRole("prefill", "prefill:old")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := current.DeepCopy()
+	foreign.UID = "foreign-uid"
+	cr := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "foreign-legacy-revision",
+			OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(foreign)},
+		},
+		Data: runtime.RawExtension{Raw: data},
+	}
+
+	if _, err := ModelServingForControllerRevision(current, cr); err == nil {
+		t.Fatal("ModelServingForControllerRevision() error = nil")
+	}
+}
+
 func TestGenerateControllerRevisionNameBoundsLongPrefix(t *testing.T) {
 	prefix := strings.Repeat("a", 240)
 	hash := "1234567890"
@@ -506,5 +575,76 @@ func revisionTestRole(name, image string) workloadv1alpha1.Role {
 				Containers: []corev1.Container{{Name: name + "-worker", Image: image}},
 			},
 		},
+	}
+}
+
+func TestPodRenderingInputsAndHistoricalOwners(t *testing.T) {
+	ms := revisionTestModelServing(revisionTestRole("decode", "decode:v1"), revisionTestRole("prefill", "prefill:v1"))
+	ms.OwnerReferences = []metav1.OwnerReference{{Kind: "LeaderWorkerSet", Name: "old-owner", UID: "old-owner"}}
+	before, err := PodRenderingModelServing(ms, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := BuildRevisionData(ms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := ms.DeepCopy()
+	current.Spec.Replicas = ptr.To[int32](9)
+	current.Labels = map[string]string{"mutable": "value"}
+	current.Spec.Template.Roles[1].EntryTemplate.Spec.Containers[0].Image = "prefill:v2"
+	after, err := PodRenderingModelServing(current, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("operational state or another role changed rendering inputs")
+	}
+	current.OwnerReferences[0].Name = "new-owner"
+	cr := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{newModelServingOwnerRef(ms)}, Annotations: map[string]string{ControllerRevisionDataVersionAnnotation: ControllerRevisionDataVersionV1}}, Data: runtime.RawExtension{Raw: data}}
+	restored, err := ApplyRevision(current, cr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	historical, err := PodRenderingModelServing(restored, "decode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, historical) {
+		t.Fatal("historical rendering did not restore owner dependencies")
+	}
+}
+
+func TestRevisionOwnerReferenceOrderIsCanonical(t *testing.T) {
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{
+			{APIVersion: "apps/v1", Kind: "Deployment", Name: "second", UID: "b"},
+			{APIVersion: "apps/v1", Kind: "Deployment", Name: "first", UID: "a", BlockOwnerDeletion: ptr.To(true)},
+		}},
+		Spec: workloadv1alpha1.ModelServingSpec{Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{revisionTestRole("decode", "image:v1")}}},
+	}
+	before := ms.DeepCopy()
+	a, err := BuildRevisionData(ms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(ms, before) {
+		t.Fatal("canonicalization mutated input")
+	}
+	ms.OwnerReferences[0], ms.OwnerReferences[1] = ms.OwnerReferences[1], ms.OwnerReferences[0]
+	b, err := BuildRevisionData(ms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Fatal("owner order changed revision data")
+	}
+	ms.OwnerReferences[0].BlockOwnerDeletion = ptr.To(false)
+	c, err := BuildRevisionData(ms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(a, c) {
+		t.Fatal("owner field change was lost")
 	}
 }

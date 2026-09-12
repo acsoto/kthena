@@ -35,7 +35,12 @@ import (
 const defaultSchedulerName = "volcano"
 
 type modelServingRevisionPatch struct {
-	Spec modelServingRevisionSpec `json:"spec"`
+	Spec     modelServingRevisionSpec `json:"spec"`
+	Metadata *revisionMetadata        `json:"metadata,omitempty"`
+}
+
+type revisionMetadata struct {
+	OwnerReferences []metav1.OwnerReference `json:"ownerReferences"`
 }
 
 type modelServingRevisionSpec struct {
@@ -75,7 +80,20 @@ func BuildRevisionData(ms *workloadv1alpha1.ModelServing) ([]byte, error) {
 	return data, nil
 }
 
+func pluginAppliesToRole(plugin workloadv1alpha1.PluginSpec, role modelServingRevisionRole) bool {
+	if plugin.Scope == nil {
+		return true
+	}
+	if len(plugin.Scope.Roles) > 0 && !slices.Contains(plugin.Scope.Roles, role.Name) {
+		return false
+	}
+	return plugin.Scope.Target != workloadv1alpha1.PluginTargetWorker || role.WorkerReplicas > 0
+}
+
 func buildRevisionPatch(ms *workloadv1alpha1.ModelServing) (*modelServingRevisionPatch, error) {
+	if ms == nil {
+		return nil, fmt.Errorf("model serving is nil")
+	}
 	normalized := ms.DeepCopy()
 	if normalized.Spec.SchedulerName == "" {
 		normalized.Spec.SchedulerName = defaultSchedulerName
@@ -131,7 +149,17 @@ func buildRevisionPatch(ms *workloadv1alpha1.ModelServing) (*modelServingRevisio
 		return roles[i].Name < roles[j].Name
 	})
 
+	var metadata *revisionMetadata
+	if len(normalized.OwnerReferences) > 0 {
+		sort.Slice(normalized.OwnerReferences, func(i, j int) bool {
+			a, _ := json.Marshal(normalized.OwnerReferences[i])
+			b, _ := json.Marshal(normalized.OwnerReferences[j])
+			return bytes.Compare(a, b) < 0
+		})
+		metadata = &revisionMetadata{OwnerReferences: normalized.OwnerReferences}
+	}
 	return &modelServingRevisionPatch{
+		Metadata: metadata,
 		Spec: modelServingRevisionSpec{
 			SchedulerName: normalized.Spec.SchedulerName,
 			Plugins:       plugins,
@@ -204,7 +232,8 @@ func RevisionDataHash(data []byte, collisionCount *int32) string {
 }
 
 // ApplyRevision restores revisioned fields while preserving operational fields
-// from the current ModelServing.
+// from the current ModelServing. Historical-only Roles use the API default of
+// one replica; runtime recovery may overlay observed replica state afterwards.
 func ApplyRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevision) (*workloadv1alpha1.ModelServing, error) {
 	if ms == nil {
 		return nil, fmt.Errorf("model serving is nil")
@@ -229,6 +258,10 @@ func ApplyRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevis
 	}
 
 	result := ms.DeepCopy()
+	result.OwnerReferences = nil
+	if patch.Metadata != nil {
+		result.OwnerReferences = patch.Metadata.OwnerReferences
+	}
 	result.Spec.SchedulerName = patch.Spec.SchedulerName
 	result.Spec.Plugins = patch.Spec.Plugins
 	result.Spec.Template.Roles = make([]workloadv1alpha1.Role, 0, len(targetRoles))
@@ -248,12 +281,62 @@ func ApplyRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevis
 		if _, exists := used[target.Name]; exists {
 			continue
 		}
-		role := revisionRole(target)
-		defaultReplicas := int32(1)
-		role.Replicas = &defaultReplicas
-		result.Spec.Template.Roles = append(result.Spec.Template.Roles, role)
+		result.Spec.Template.Roles = append(result.Spec.Template.Roles, revisionRole(target))
 	}
 	return result, nil
+}
+
+// ModelServingForControllerRevision returns the ModelServing configuration to
+// use when creating workloads for a ControllerRevision. V1 revisions restore
+// every revisioned field. Legacy revisions only contain Roles, so fields that
+// were never recorded by the legacy format remain sourced from the current
+// ModelServing.
+func ModelServingForControllerRevision(ms *workloadv1alpha1.ModelServing, cr *appsv1.ControllerRevision) (*workloadv1alpha1.ModelServing, error) {
+	if ms == nil {
+		return nil, fmt.Errorf("model serving is nil")
+	}
+	if cr == nil || len(cr.Data.Raw) == 0 {
+		return nil, fmt.Errorf("controller revision or its data is nil")
+	}
+	if cr.Annotations[ControllerRevisionDataVersionAnnotation] == ControllerRevisionDataVersionV1 {
+		return ApplyRevision(ms, cr)
+	}
+	if !metav1.IsControlledBy(cr, ms) {
+		return nil, fmt.Errorf("controller revision %q is not controlled by ModelServing %s/%s", cr.Name, ms.Namespace, ms.Name)
+	}
+
+	roles, err := decodeLegacyRevisionRoles(cr.Data.Raw)
+	if err != nil {
+		return nil, err
+	}
+	result := ms.DeepCopy()
+	result.Spec.Template.Roles = mergeRevisionRoles(ms.Spec.Template.Roles, roles)
+	return result, nil
+}
+
+func mergeRevisionRoles(current, revision []workloadv1alpha1.Role) []workloadv1alpha1.Role {
+	currentByName := make(map[string]workloadv1alpha1.Role, len(current))
+	for i := range current {
+		currentByName[current[i].Name] = current[i]
+	}
+
+	result := make([]workloadv1alpha1.Role, 0, len(revision))
+	for i := range revision {
+		role := *revision[i].DeepCopy()
+		currentRole, exists := currentByName[role.Name]
+		if !exists {
+			if role.Replicas == nil {
+				defaultReplicas := int32(1)
+				role.Replicas = &defaultReplicas
+			}
+			result = append(result, role)
+			continue
+		}
+		role.Replicas = copyInt32(currentRole.Replicas)
+		role.RollingUpdateConfiguration = *currentRole.RollingUpdateConfiguration.DeepCopy()
+		result = append(result, role)
+	}
+	return result
 }
 
 func decodeRevisionPatch(data []byte) (*modelServingRevisionPatch, error) {
@@ -277,6 +360,8 @@ func decodeRevisionPatch(data []byte) (*modelServingRevisionPatch, error) {
 func revisionRole(source modelServingRevisionRole) workloadv1alpha1.Role {
 	role := workloadv1alpha1.Role{}
 	applyRevisionRole(&role, source)
+	defaultReplicas := int32(1)
+	role.Replicas = &defaultReplicas
 	return role
 }
 
@@ -289,4 +374,37 @@ func applyRevisionRole(target *workloadv1alpha1.Role, source modelServingRevisio
 	} else {
 		target.WorkerTemplate = source.WorkerTemplate.DeepCopy()
 	}
+}
+
+// PodRenderingModelServing supplies only identity and canonical, role-scoped
+// revision inputs to Pod creation plugins. Operational state must not affect
+// rendered Pods, and another Role's configuration must not affect this Role.
+func PodRenderingModelServing(ms *workloadv1alpha1.ModelServing, roleName string) (*workloadv1alpha1.ModelServing, error) {
+	patch, err := buildRevisionPatch(ms)
+	if err != nil {
+		return nil, err
+	}
+	result := &workloadv1alpha1.ModelServing{ObjectMeta: metav1.ObjectMeta{Name: ms.Name, Namespace: ms.Namespace, UID: ms.UID}}
+	if patch.Metadata != nil {
+		result.OwnerReferences = patch.Metadata.OwnerReferences
+	}
+	result.Spec.SchedulerName = patch.Spec.SchedulerName
+	for _, role := range patch.Spec.Template.Roles {
+		if role.Name != roleName {
+			continue
+		}
+		result.Spec.Template.Roles = []workloadv1alpha1.Role{revisionRole(role)}
+		for _, plugin := range patch.Spec.Plugins {
+			if !pluginAppliesToRole(plugin, role) {
+				continue
+			}
+			if plugin.Scope != nil && len(plugin.Scope.Roles) > 0 {
+				plugin.Scope = plugin.Scope.DeepCopy()
+				plugin.Scope.Roles = []string{roleName}
+			}
+			result.Spec.Plugins = append(result.Spec.Plugins, plugin)
+		}
+		return result, nil
+	}
+	return nil, fmt.Errorf("role %q not found", roleName)
 }

@@ -70,6 +70,18 @@ func TestModelServingLifecycle(t *testing.T) {
 	for _, pod := range podList.Items {
 		assert.Equal(t, corev1.PodRunning, pod.Status.Phase, "Pod %s should be running", pod.Name)
 	}
+	initialMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, initialMS.Status.CurrentRevision)
+	initialHistory, err := kubeClient.AppsV1().ControllerRevisions(testNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: modelServingLabelSelector(modelServing.Name),
+	})
+	require.NoError(t, err)
+	require.Len(t, initialHistory.Items, 1)
+	initialRevision := &initialHistory.Items[0]
+	assert.Equal(t, initialMS.Status.CurrentRevision, initialRevision.Labels[controllerutils.ControllerRevisionRevisionLabelKey])
+	assert.Equal(t, controllerutils.ControllerRevisionDataVersionV1, initialRevision.Annotations[controllerutils.ControllerRevisionDataVersionAnnotation])
+	initialRevisionData := append([]byte(nil), initialRevision.Data.Raw...)
 	t.Log("Phase 1 passed: ModelServing created and ready")
 
 	// Phase 2: Update (change container image)
@@ -114,6 +126,22 @@ func TestModelServingLifecycle(t *testing.T) {
 		}
 		return true
 	}, 3*time.Minute, 5*time.Second, fmt.Sprintf("Not all pods were updated to %s", nginxAlpineImage))
+	finalMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotEqual(t, initialMS.Status.CurrentRevision, finalMS.Status.CurrentRevision)
+	history, err := kubeClient.AppsV1().ControllerRevisions(testNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: modelServingLabelSelector(modelServing.Name),
+	})
+	require.NoError(t, err)
+	require.Len(t, history.Items, 2)
+	foundInitialRevision := false
+	for i := range history.Items {
+		if history.Items[i].Labels[controllerutils.ControllerRevisionRevisionLabelKey] == initialMS.Status.CurrentRevision {
+			foundInitialRevision = true
+			assert.Equal(t, initialRevisionData, history.Items[i].Data.Raw, "historical revision data must remain immutable")
+		}
+	}
+	require.True(t, foundInitialRevision, "initial ControllerRevision should be retained")
 	t.Log("Phase 2 passed: ModelServing updated successfully")
 
 	// Phase 3: Delete
@@ -1110,6 +1138,84 @@ func hasExpectedOrdinalRange[T any](states map[int32]T, replicas int32) bool {
 // waitForRollingUpdateConverged polls until a rolling update without partition has fully converged:
 // CurrentRevision has caught up to UpdateRevision, status counters match Spec.Replicas, and the
 // calculateGroupPartitionState counts how many serving groups are on the protected (current) revision
+// TestPartitionRevisionHistoryRecovery exercises stable partition GC and recovery
+// from a historical snapshot after the protected Pod is deleted.
+func TestPartitionRevisionHistoryRecovery(t *testing.T) {
+	for _, limit := range []int32{0, 1} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			ctx, client, kube := setupControllerManagerE2ETest(t)
+			ms := createBasicModelServing(fmt.Sprintf("partition-history-%d", limit), 2, 1)
+			ms.Spec.RevisionHistoryLimit = ptr.To(limit)
+			ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "REVISION_TEST", Value: "A"}}
+			createAndWaitForModelServing(t, ctx, client, ms)
+			initial, err := client.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, ms.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			oldRevision := initial.Status.CurrentRevision
+			require.NotEmpty(t, oldRevision)
+			selector := modelServingLabelSelector(ms.Name)
+			protectedName := ""
+			var protectedUID types.UID
+			for _, version := range []string{"B", "C", "D"} {
+				updateModelServingWithRetry(t, ctx, client, ms.Name, func(current *workload.ModelServing) {
+					current.Spec.RolloutStrategy.RollingUpdateConfiguration.Partition = ptr.To(intstr.FromInt32(1))
+					current.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Env[0].Value = version
+				})
+				require.Eventually(t, func() bool {
+					pods, err := kube.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+					if err != nil || len(pods.Items) != 2 {
+						return false
+					}
+					old, updated := 0, 0
+					for _, pod := range pods.Items {
+						if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+							return false
+						}
+						for _, env := range pod.Spec.Containers[0].Env {
+							if env.Name != "REVISION_TEST" {
+								continue
+							}
+							if env.Value == "A" {
+								old++
+								protectedName = pod.Name
+								protectedUID = pod.UID
+							}
+							if env.Value == version {
+								updated++
+							}
+						}
+					}
+					return old == 1 && updated == 1
+				}, 3*time.Minute, 2*time.Second, "partition must retain A and update the other replica to %s", version)
+			}
+			require.Eventually(t, func() bool {
+				history, err := kube.AppsV1().ControllerRevisions(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+				if err != nil || len(history.Items) != 2+int(limit) {
+					return false
+				}
+				current, err := client.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, ms.Name, metav1.GetOptions{})
+				return err == nil && current.Status.CurrentRevision == oldRevision && len(current.Status.RevisionReferences) == 2
+			}, time.Minute, 2*time.Second, "unused revisions must obey history limit while partition is active")
+			require.NotEmpty(t, protectedName)
+			require.NoError(t, kube.CoreV1().Pods(testNamespace).Delete(ctx, protectedName, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &protectedUID}}))
+			require.Eventually(t, func() bool {
+				pod, err := kube.CoreV1().Pods(testNamespace).Get(ctx, protectedName, metav1.GetOptions{})
+				if err != nil || pod.UID == protectedUID || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+					return false
+				}
+				if pod.Labels[workload.RevisionLabelKey] != oldRevision {
+					return false
+				}
+				for _, env := range pod.Spec.Containers[0].Env {
+					if env.Name == "REVISION_TEST" {
+						return env.Value == "A"
+					}
+				}
+				return false
+			}, 3*time.Minute, 2*time.Second, "protected replica must recover the historical template after GC")
+		})
+	}
+}
+
 // TestModelServingControllerManagerRestart verifies that ModelServing pod creation
 // is successful even when the controller-manager restarts during reconciliation.
 // NOTE: This test must remain last among ModelServing tests because it restarts the
