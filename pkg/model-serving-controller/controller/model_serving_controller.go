@@ -68,6 +68,8 @@ const (
 	RoleIDKey    = "RoleID"
 )
 
+var errControllerRevisionNotFound = errors.New("ControllerRevision not found")
+
 // PodGroupManager is the interface for managing PodGroups.
 // This interface allows for dependency injection in tests.
 type PodGroupManager interface {
@@ -283,8 +285,8 @@ func (c *ModelServingController) updateModelServing(old, cur interface{}) {
 	}
 
 	if reflect.DeepEqual(oldms.Spec, curms.Spec) {
-		// If the spec has not changed, we do not need to reconcile.
-		klog.V(4).InfoS("Spec has not changed, skipping update", "modelServing", klog.KObj(curms))
+		// Status-only changes do not require reconciliation.
+		klog.V(4).InfoS("Workload inputs have not changed, skipping update", "modelServing", klog.KObj(curms))
 		return
 	}
 
@@ -558,8 +560,18 @@ func (c *ModelServingController) syncModelServing(ctx context.Context, key strin
 		return err
 	}
 
-	revision := utils.ModelServingRevision(ms)
-
+	revisionData, err := utils.BuildRevisionData(ms)
+	if err != nil {
+		return fmt.Errorf("build ModelServing revision data: %w", err)
+	}
+	controllerRevision, collisionCount, err := utils.RecordModelServingRevision(ctx, c.kubeClientSet, ms, revisionData)
+	if err != nil {
+		return fmt.Errorf("record ModelServing revision: %w", err)
+	}
+	revision := controllerRevision.Labels[utils.ControllerRevisionRevisionLabelKey]
+	if revision == "" {
+		return fmt.Errorf("recorded ControllerRevision %s has no revision label", controllerRevision.Name)
+	}
 	// 1. Sync the number of ServingGroups to match the expected replicas defined in spec.
 	if err := c.syncServingGroupReplicas(ctx, ms, revision); err != nil {
 		return fmt.Errorf("failed to sync ServingGroup replicas: %v", err)
@@ -581,7 +593,9 @@ func (c *ModelServingController) syncModelServing(ctx context.Context, key strin
 	}
 
 	// 5. Calculate and update the overall condition and replica status fields of the ModelServing.
-	if err := c.UpdateModelServingStatus(ms, revision); err != nil {
+	statusMS := ms.DeepCopy()
+	statusMS.Status.CollisionCount = collisionCount
+	if err := c.UpdateModelServingStatus(ctx, statusMS, revision); err != nil {
 		return fmt.Errorf("failed to update status of ms %s/%s: %v", namespace, name, err)
 	}
 
@@ -740,16 +754,15 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 		utils.GetNamespaceName(ms), existingOrdinals, toCreate)
 
 	// Helper function to create a ServingGroup
-	createServingGroup := func(ordinal int, revision string, roles []workloadv1alpha1.Role) error {
+	createServingGroup := func(ordinal int, revision string, workload *workloadv1alpha1.ModelServing) error {
 		groupName := utils.GenerateServingGroupName(ms.Name, ordinal)
 		klog.V(4).Infof("scaleUpServingGroups: creating/updating PodGroup for ServingGroup=%s", groupName)
 		// Ensure a PodGroup exists for the new ServingGroup when gang scheduling is enabled.
-		if err := c.createOrUpdatePodGroupByServingGroup(ctx, ms, groupName); err != nil {
+		if err := c.createOrUpdatePodGroupByServingGroup(ctx, workload, groupName); err != nil {
 			return err
 		}
 		klog.V(4).Infof("Creating ServingGroup %s at ordinal %d with revision %s", groupName, ordinal, revision)
-		// Create pods for ServingGroup using the provided roles template
-		if err := c.CreatePodsForServingGroup(ctx, ms, ordinal, revision, roles); err != nil {
+		if err := c.CreatePodsForServingGroup(ctx, workload, ordinal, revision); err != nil {
 			return fmt.Errorf("create Serving group failed: %v", err)
 		}
 		// Insert new ServingGroup to global storage
@@ -758,12 +771,6 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 		return nil
 	}
 
-	// Persist the template snapshot before creating a ServingGroup that references
-	// newRevision. ModelServing.Spec.Template is mutable, while ControllerRevision
-	// lets a future partition-protected recovery resolve this revision's template.
-	// Create it lazily because restoring only ordinals below partition uses the
-	// existing CurrentRevision and does not need a new snapshot.
-	newRevisionCreated := false
 	var scaleUpErr error
 	forEachMissingOrdinal(expectedCount, existingOrdinals, toCreate, func(ordinal int) bool {
 		if partition > 0 && ordinal < partition {
@@ -775,57 +782,26 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 			klog.V(4).Infof("scaleUpServingGroups: ordinal %d missing (partition-protected), revisionToUse=%s, currentRevision=%s",
 				ordinal, revisionToUse, ms.Status.CurrentRevision)
 
-			// For ordinal < partition, we should use the old template from the revision
-			// Two cases:
-			// 1. First startup: use ms.Spec.Template.Roles (which corresponds to CurrentRevision)
-			// 2. During recovery: use template from ControllerRevision retrieved by revision
-			var rolesToUse []workloadv1alpha1.Role
-			cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revisionToUse)
-			if err != nil {
-				scaleUpErr = fmt.Errorf("failed to get ControllerRevision %s for protected ordinal %d: %w", revisionToUse, ordinal, err)
-				return false
-			}
-			if cr != nil {
-				// Case 2: Recovery scenario - use template from ControllerRevision
-				if roles, err := utils.GetRolesFromControllerRevision(cr); err != nil {
-					scaleUpErr = fmt.Errorf("failed to get roles from ControllerRevision %s for protected ordinal %d: %w", revisionToUse, ordinal, err)
-					return false
-				} else {
-					rolesToUse = roles
-					klog.V(4).Infof("Recovering ServingGroup at ordinal %d with revision %s using template from ControllerRevision (partition=%d)", ordinal, revisionToUse, partition)
-				}
-			} else if revisionToUse == newRevision {
-				// First startup: persist the current template before creating even a
-				// protected ordinal so later recovery never depends on mutable spec.
-				if _, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, revisionToUse, ms.Spec.Template.Roles); err != nil {
-					scaleUpErr = fmt.Errorf("failed to create ControllerRevision %s for protected ordinal %d: %w", revisionToUse, ordinal, err)
+			workload := ms
+			if revisionToUse != newRevision {
+				var err error
+				workload, err = c.modelServingForRevision(ctx, ms, revisionToUse)
+				if err != nil {
+					scaleUpErr = fmt.Errorf("resolve revision %s for partition-protected ServingGroup ordinal %d: %w", revisionToUse, ordinal, err)
 					return false
 				}
-				rolesToUse = ms.Spec.Template.Roles
-			} else {
-				scaleUpErr = fmt.Errorf("ControllerRevision %s for protected ordinal %d was not found", revisionToUse, ordinal)
-				return false
+				klog.V(4).Infof("Recovering ServingGroup at ordinal %d with revision %s using ControllerRevision (partition=%d)", ordinal, revisionToUse, partition)
 			}
 
-			if err := createServingGroup(ordinal, revisionToUse, rolesToUse); err != nil {
+			if err := createServingGroup(ordinal, revisionToUse, workload); err != nil {
 				scaleUpErr = err
 				return false
 			}
 			return true
 		}
 
-		if !newRevisionCreated {
-			// All ServingGroups created with newRevision share this snapshot, so create
-			// it only once during this reconciliation.
-			klog.V(4).Infof("scaleUpServingGroups: creating ControllerRevision for newRevision=%s, modelServing=%s", newRevision, utils.GetNamespaceName(ms))
-			if _, err := utils.CreateControllerRevision(ctx, c.kubeClientSet, ms, newRevision, ms.Spec.Template.Roles); err != nil {
-				scaleUpErr = fmt.Errorf("failed to create ControllerRevision for new revision %s: %w", newRevision, err)
-				return false
-			}
-			newRevisionCreated = true
-		}
 		klog.V(4).Infof("scaleUpServingGroups: creating new ServingGroup at ordinal=%d with newRevision=%s for modelServing=%s", ordinal, newRevision, utils.GetNamespaceName(ms))
-		if err := createServingGroup(ordinal, newRevision, ms.Spec.Template.Roles); err != nil {
+		if err := createServingGroup(ordinal, newRevision, ms); err != nil {
 			scaleUpErr = err
 			return false
 		}
@@ -862,7 +838,6 @@ func (c *ModelServingController) syncRoleReplicas(ctx context.Context, ms *workl
 		_, servingGroupOrdinal := utils.GetParentNameAndOrdinal(servingGroup.Name)
 		isPartitionProtected := partition > 0 && index < partition
 
-		rolesToManage := ms.Spec.Template.Roles
 		revisionToUse := newRevision
 		if isPartitionProtected {
 			if revision, ok := c.store.GetServingGroupRevision(utils.GetNamespaceName(ms), servingGroup.Name); ok && revision != "" {
@@ -870,25 +845,17 @@ func (c *ModelServingController) syncRoleReplicas(ctx context.Context, ms *workl
 			} else if ms.Status.CurrentRevision != "" {
 				revisionToUse = ms.Status.CurrentRevision
 			}
-
-			if revisionToUse != "" {
-				cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revisionToUse)
-				if err != nil {
-					return fmt.Errorf("failed to get ControllerRevision %s for protected ServingGroup %s: %v", revisionToUse, servingGroup.Name, err)
-				} else if cr != nil {
-					if oldRoles, err := utils.GetRolesFromControllerRevision(cr); err != nil {
-						return fmt.Errorf("failed to get roles from ControllerRevision %s for protected ServingGroup %s: %v", revisionToUse, servingGroup.Name, err)
-					} else {
-						rolesToManage = oldRoles
-					}
-				} else if revisionToUse != newRevision {
-					return fmt.Errorf("ControllerRevision %s for protected ServingGroup %s was not found", revisionToUse, servingGroup.Name)
-				}
-			}
 		}
 
-		for _, targetRole := range rolesToManage {
-			c.manageRoleReplicasPerGroup(ctx, ms, servingGroup.Name, targetRole, servingGroupOrdinal, revisionToUse)
+		// Existing groups are reconciled against the current operational role
+		// layout. Historical revision data is loaded lazily by
+		// roleTemplateForReplica only when a protected replica is actually
+		// missing and must be recreated.
+		for _, targetRole := range ms.Spec.Template.Roles {
+			historicalGroup := isPartitionProtected && revisionToUse != newRevision
+			if err := c.manageRoleReplicasPerGroup(ctx, ms, servingGroup.Name, targetRole, servingGroupOrdinal, newRevision, historicalGroup); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -999,12 +966,14 @@ func (c *ModelServingController) scaleDownRoles(ctx context.Context, ms *workloa
 	}
 }
 
-// scaleUpRoles fills missing Role ordinals in [0, expectedCount).
-// Missing ordinals below partition use CurrentRevision; the rest use newRevision.
-func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName string, targetRole workloadv1alpha1.Role, roleList []datastore.Role, expectedCount int, servingGroupOrdinal int, newRevision string) {
+// scaleUpRoles fills missing Role ordinals in [0, expectedCount). A
+// partition-protected historical group uses its recorded revision; otherwise
+// missing ordinals below a RoleRollingUpdate partition use CurrentRevision and
+// the rest use newRevision.
+func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName string, targetRole workloadv1alpha1.Role, roleList []datastore.Role, expectedCount int, servingGroupOrdinal int, newRevision string, historicalGroup bool) error {
 	partition, partitionConfigured, partitionErr := c.getPartition(rolePartition(ms, targetRole), roleReplicas(targetRole))
 	if partitionErr != nil {
-		klog.Errorf("scaleUpRoles: failed to parse partition for role %s: %v", targetRole.Name, partitionErr)
+		return fmt.Errorf("parse partition for role %s: %w", targetRole.Name, partitionErr)
 	}
 
 	existingOrdinals := make([]int, 0, len(roleList))
@@ -1022,14 +991,13 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 	err := c.store.UpdateServingGroupStatus(utils.GetNamespaceName(ms), groupName, datastore.ServingGroupScaling)
 	klog.V(4).Infof("Setting ServingGroup %s/%s status to Scaling for role %s scaling up", ms.Namespace+"/"+ms.Name, groupName, targetRole.Name)
 	if err != nil {
-		klog.Errorf("failed to set ServingGroup %s/%s status: %v", ms.Namespace+"/"+ms.Name, groupName, err)
-		return
+		return fmt.Errorf("set ServingGroup %s/%s status: %w", ms.Namespace+"/"+ms.Name, groupName, err)
 	}
 
 	// Helper function to create a Role
-	createRole := func(ordinal int, revision string, roleToApply workloadv1alpha1.Role, roleTemplateHash string) error {
+	createRole := func(ordinal int, revision string, workload *workloadv1alpha1.ModelServing, roleToApply workloadv1alpha1.Role, roleTemplateHash string) error {
 		// Create pods for role
-		err := c.CreatePodsByRole(ctx, *roleToApply.DeepCopy(), ms, ordinal, servingGroupOrdinal, revision, roleTemplateHash)
+		err := c.CreatePodsByRole(ctx, *roleToApply.DeepCopy(), workload, ordinal, servingGroupOrdinal, revision, roleTemplateHash)
 		if err != nil {
 			return fmt.Errorf("create role %s for ServingGroup %s failed: %v", utils.GenerateRoleID(targetRole.Name, ordinal), groupName, err)
 		}
@@ -1043,85 +1011,76 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 	}
 
 	roleTemplateHash := utils.CalRoleTemplateHash(targetRole)
+	var scaleUpErr error
 	forEachMissingOrdinal(expectedCount, existingOrdinals, toCreate, func(ordinal int) bool {
-		if partitionConfigured && partition > 0 && ordinal < partition {
+		if historicalGroup || (partitionConfigured && partition > 0 && ordinal < partition) {
 			// Use CurrentRevision for partition-protected ordinals
 			revisionToUse := newRevision
-			if ms.Status.CurrentRevision != "" {
-				revisionToUse = ms.Status.CurrentRevision
-			}
-			// RoleRollingUpdate may advance CurrentRevision before all protected replicas are recovered.
-			if revisionToUse == newRevision {
-				crSelector := labels.SelectorFromSet(map[string]string{
-					utils.ControllerRevisionLabelKey: ms.Name,
-				})
-				if crList, listErr := c.kubeClientSet.AppsV1().ControllerRevisions(ms.Namespace).List(ctx, metav1.ListOptions{
-					LabelSelector: crSelector.String(),
-				}); listErr != nil {
-					klog.Warningf("scaleUpRoles: failed to list ControllerRevisions for ModelServing %s/%s: %v", ms.Namespace, ms.Name, listErr)
-				} else {
-					for i := range crList.Items {
-						rev := crList.Items[i].Labels[utils.ControllerRevisionRevisionLabelKey]
-						if rev != "" && rev != newRevision {
-							revisionToUse = rev
-							break
-						}
-					}
+			if historicalGroup {
+				if groupRevision, ok := c.store.GetServingGroupRevision(utils.GetNamespaceName(ms), groupName); ok && groupRevision != "" {
+					revisionToUse = groupRevision
+				} else if ms.Status.CurrentRevision != "" {
+					revisionToUse = ms.Status.CurrentRevision
 				}
+			} else if ms.Status.CurrentRevision != "" {
+				revisionToUse = ms.Status.CurrentRevision
+			} else if groupRevision, ok := c.store.GetServingGroupRevision(utils.GetNamespaceName(ms), groupName); ok && groupRevision != "" {
+				revisionToUse = groupRevision
 			}
 			klog.V(4).Infof("scaleUpRoles: ordinal %d missing (partition-protected), revisionToUse=%s, currentRevision=%s",
 				ordinal, revisionToUse, ms.Status.CurrentRevision)
 
-			// For ordinal < partition, we should use the old template from the revision
-			// Two cases:
-			// 1. First startup: use targetRole (which corresponds to CurrentRevision)
-			// 2. During recovery: use template from ControllerRevision retrieved by revision
+			workload := ms
 			roleToApply := targetRole
-			cr, _ := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revisionToUse)
-			if cr != nil {
-				// Case 2: Recovery scenario - use template from ControllerRevision
-				if roles, err := utils.GetRolesFromControllerRevision(cr); err != nil {
-					klog.Warningf("scaleUpRoles: failed to get roles from ControllerRevision for revision %s (ordinal %d): %v, falling back to current role template", revisionToUse, ordinal, err)
-				} else {
-					for _, oldRole := range roles {
-						if oldRole.Name == targetRole.Name {
-							roleToApply = oldRole
-							break
-						}
-					}
-					klog.V(4).Infof("Recovering role %s at ordinal %d with revision %s using template from ControllerRevision (partition=%d)", targetRole.Name, ordinal, revisionToUse, partition)
+			if revisionToUse != newRevision {
+				var err error
+				workload, err = c.modelServingForRevision(ctx, ms, revisionToUse)
+				if err != nil {
+					scaleUpErr = fmt.Errorf("resolve revision %s for partition-protected role %s ordinal %d: %w", revisionToUse, targetRole.Name, ordinal, err)
+					return false
 				}
-			} else {
-				// Case 1: First startup - ControllerRevision not found, use current role template
-				klog.V(4).Infof("Creating missing role %s at ordinal %d with revision %s using current role template (partition=%d, first startup)", targetRole.Name, ordinal, revisionToUse, partition)
+				found := false
+				for i := range workload.Spec.Template.Roles {
+					if workload.Spec.Template.Roles[i].Name == targetRole.Name {
+						roleToApply = workload.Spec.Template.Roles[i]
+						found = true
+						break
+					}
+				}
+				if !found {
+					scaleUpErr = fmt.Errorf("revision %s does not contain role %s", revisionToUse, targetRole.Name)
+					return false
+				}
 			}
 			hashToUse := utils.CalRoleTemplateHash(roleToApply)
-			if err := createRole(ordinal, revisionToUse, roleToApply, hashToUse); err != nil {
-				klog.Errorf("scaleUpRoles: failed to create role %s at ordinal %d in ServingGroup %s of ModelServing %s/%s: %v", targetRole.Name, ordinal, groupName, ms.Namespace, ms.Name, err)
+			if err := createRole(ordinal, revisionToUse, workload, roleToApply, hashToUse); err != nil {
+				scaleUpErr = err
+				return false
 			}
 			return true
 		}
-		if err := createRole(ordinal, newRevision, targetRole, roleTemplateHash); err != nil {
-			klog.Errorf("scaleUpRoles: failed to create role %s at ordinal %d in ServingGroup %s of ModelServing %s/%s: %v", targetRole.Name, ordinal, groupName, ms.Namespace, ms.Name, err)
+		if err := createRole(ordinal, newRevision, ms, targetRole, roleTemplateHash); err != nil {
+			scaleUpErr = err
+			return false
 		}
 		return true
 	})
+	return scaleUpErr
 }
 
 // manageRoleReplicasPerGroup manages the replicas of a specific role within an Serving group
 // It handles both scale up and scale down operations for the role
-func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName string, targetRole workloadv1alpha1.Role, servingGroupOrdinal int, newRevision string) {
+func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName string, targetRole workloadv1alpha1.Role, servingGroupOrdinal int, desiredRevision string, historicalGroup bool) error {
 	// TODO: add podGroup update after gang scheduler finished
 	// Get all replicas of a role from storage, for example, prefill-0, prefill-1...
 	roleList, err := c.store.GetRoleList(utils.GetNamespaceName(ms), groupName, targetRole.Name)
 	if err != nil {
-		klog.Errorf("manageRoleReplicasPerGroup: cannot get role %s in ServingGroup %s, err:%v", targetRole.Name, groupName, err)
-		return
+		return fmt.Errorf("get role %s in ServingGroup %s: %w", targetRole.Name, groupName, err)
 	}
 
 	expectedCount := roleReplicas(targetRole)
 	if ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.Type == workloadv1alpha1.RoleRollingUpdate &&
-		c.hasUpdateableOutdatedRole(ms, groupName, targetRole, roleList) {
+		c.hasUpdateableOutdatedRole(ctx, ms, groupName, targetRole, roleList) {
 		maxSurge, err := utils.GetMaxSurgeForRole(targetRole)
 		if err != nil {
 			klog.Errorf("manageRoleReplicasPerGroup: failed to calculate maxSurge for role %s in ServingGroup %s: %v", targetRole.Name, groupName, err)
@@ -1155,11 +1114,14 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 		}
 		if len(pods) < expectedPods {
 			klog.V(2).Infof("manageRoleReplicasPerGroup: role %s/%s in ServingGroup %s is missing pods (%d/%d), recreating", targetRole.Name, roleObj.Name, groupName, len(pods), expectedPods)
-			partitionProtected := partitionConfigured && partition > 0 && index < partition
-			roleToApply, revisionToUse, hashToUse := c.roleTemplateForReplica(ctx, ms, targetRole, roleObj, newRevision, partitionProtected)
+			partitionProtected := historicalGroup || (partitionConfigured && partition > 0 && index < partition)
+			roleToApply, workloadToApply, replicaRevision, hashToUse, err := c.roleTemplateForReplica(ctx, ms, targetRole, roleObj, desiredRevision, partitionProtected)
+			if err != nil {
+				return fmt.Errorf("resolve workload for role %s/%s: %w", targetRole.Name, roleObj.Name, err)
+			}
 			_, roleIndex := utils.GetParentNameAndOrdinal(roleObj.Name)
-			if err := c.CreatePodsByRole(ctx, *roleToApply.DeepCopy(), ms, roleIndex, servingGroupOrdinal, revisionToUse, hashToUse); err != nil {
-				klog.Errorf("manageRoleReplicasPerGroup: failed to recreate pods for role %s/%s in ServingGroup %s: %v", targetRole.Name, roleObj.Name, groupName, err)
+			if err := c.CreatePodsByRole(ctx, *roleToApply.DeepCopy(), workloadToApply, roleIndex, servingGroupOrdinal, replicaRevision, hashToUse); err != nil {
+				return fmt.Errorf("recreate pods for role %s/%s in ServingGroup %s: %w", targetRole.Name, roleObj.Name, groupName, err)
 			}
 		}
 	}
@@ -1167,11 +1129,14 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 	// Determine whether it is a scale-up or scale-down scenario
 	if len(roleList) < expectedCount {
 		klog.V(2).Infof("manageRoleReplicasPerGroup: scaling UP role %s in ServingGroup %s: current=%d, expected=%d", targetRole.Name, groupName, len(roleList), expectedCount)
-		c.scaleUpRoles(ctx, ms, groupName, targetRole, roleList, expectedCount, servingGroupOrdinal, newRevision)
+		if err := c.scaleUpRoles(ctx, ms, groupName, targetRole, roleList, expectedCount, servingGroupOrdinal, desiredRevision, historicalGroup); err != nil {
+			return err
+		}
 	} else if len(roleList) > expectedCount {
 		klog.V(2).Infof("manageRoleReplicasPerGroup: scaling DOWN role %s in ServingGroup %s: current=%d, expected=%d", targetRole.Name, groupName, len(roleList), expectedCount)
 		c.scaleDownRoles(ctx, ms, groupName, targetRole, roleList, expectedCount)
 	}
+	return nil
 }
 
 // hasUpdateableOutdatedRole reports whether a Role has an outdated replica
@@ -1179,6 +1144,7 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 // expected replica count; individual replicas are not classified as surge by
 // ordinal because binpack scale-down may leave sparse or high ordinals.
 func (c *ModelServingController) hasUpdateableOutdatedRole(
+	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
 	groupName string,
 	targetRole workloadv1alpha1.Role,
@@ -1189,15 +1155,19 @@ func (c *ModelServingController) hasUpdateableOutdatedRole(
 		klog.Errorf("hasUpdateableOutdatedRole: failed to calculate partition for role %s in ServingGroup %s: %v", targetRole.Name, groupName, err)
 		return false
 	}
-	expectedHash := utils.CalRoleTemplateHash(targetRole)
 	for index, role := range roleList {
 		if index < partition || role.Status == datastore.RoleDeleting {
 			continue
 		}
-		if observedHash, ok := c.resolveRoleTemplateHashForComparison(ms, datastore.ServingGroup{
+		outdated, err := c.roleNeedsUpdate(ctx, ms, datastore.ServingGroup{
 			Name:     groupName,
 			Revision: role.Revision,
-		}, targetRole.Name, role); ok && observedHash != expectedHash {
+		}, targetRole, role)
+		if err != nil {
+			klog.Errorf("hasUpdateableOutdatedRole: failed to compare role %s/%s in ServingGroup %s: %v", targetRole.Name, role.Name, groupName, err)
+			continue
+		}
+		if outdated {
 			return true
 		}
 	}
@@ -1213,45 +1183,49 @@ func (c *ModelServingController) roleTemplateForReplica(
 	roleObj datastore.Role,
 	newRevision string,
 	partitionProtected bool,
-) (workloadv1alpha1.Role, string, string) {
+) (workloadv1alpha1.Role, *workloadv1alpha1.ModelServing, string, string, error) {
 	roleToApply := targetRole
+	workloadToApply := ms
 	revisionToUse := newRevision
 	hashToUse := ""
 	if !partitionProtected {
-		return roleToApply, revisionToUse, utils.CalRoleTemplateHash(roleToApply)
+		return roleToApply, workloadToApply, revisionToUse, utils.CalRoleTemplateHash(roleToApply), nil
 	}
 
 	revisionToUse = roleObj.Revision
 	if revisionToUse == "" {
 		revisionToUse = ms.Status.CurrentRevision
 	}
-	hashToUse = roleObj.RoleTemplateHash
 	if revisionToUse == "" {
-		if hashToUse == "" {
-			hashToUse = utils.CalRoleTemplateHash(roleToApply)
-		}
-		return roleToApply, revisionToUse, hashToUse
+		hashToUse := utils.CalRoleTemplateHash(roleToApply)
+		return roleToApply, workloadToApply, revisionToUse, hashToUse, nil
 	}
 
-	cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revisionToUse)
-	if err != nil {
-		klog.Warningf("roleTemplateForReplica: failed to get ControllerRevision %s for partition-protected role %s: %v", revisionToUse, roleObj.Name, err)
-	} else if cr != nil {
-		if oldRoles, err := utils.GetRolesFromControllerRevision(cr); err != nil {
-			klog.Warningf("roleTemplateForReplica: failed to get roles from ControllerRevision %s for partition-protected role %s: %v", revisionToUse, roleObj.Name, err)
-		} else {
-			for _, oldRole := range oldRoles {
-				if oldRole.Name == targetRole.Name {
-					roleToApply = oldRole
-					break
-				}
+	if revisionToUse != newRevision {
+		var err error
+		workloadToApply, err = c.modelServingForRevision(ctx, ms, revisionToUse)
+		if err != nil {
+			return roleToApply, nil, "", "", err
+		}
+		found := false
+		for i := range workloadToApply.Spec.Template.Roles {
+			if workloadToApply.Spec.Template.Roles[i].Name == targetRole.Name {
+				roleToApply = workloadToApply.Spec.Template.Roles[i]
+				found = true
+				break
 			}
 		}
+		if !found {
+			return roleToApply, nil, "", "", fmt.Errorf("revision %s does not contain role %s", revisionToUse, targetRole.Name)
+		}
 	}
+	// A historical snapshot normalizes fields that the original template hash
+	// included. Keep the existing instance's identity while replacing its Pods.
+	hashToUse = roleObj.RoleTemplateHash
 	if hashToUse == "" {
 		hashToUse = utils.CalRoleTemplateHash(roleToApply)
 	}
-	return roleToApply, revisionToUse, hashToUse
+	return roleToApply, workloadToApply, revisionToUse, hashToUse, nil
 }
 
 // emitRoleStatusEvent emits a Kubernetes Event for a role-related status change.
@@ -1372,7 +1346,10 @@ func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1a
 //  4. For RoleRollingUpdate, update outdated roles using each Role's maxUnavailable budget.
 func (c *ModelServingController) manageRollingUpdate(ctx context.Context, ms *workloadv1alpha1.ModelServing, revision string) error {
 	servingGroupList, err := c.store.GetServingGroupByModelServing(utils.GetNamespaceName(ms))
-	if err != nil && !errors.Is(err, datastore.ErrServingGroupNotFound) {
+	if err != nil {
+		if errors.Is(err, datastore.ErrServingGroupNotFound) {
+			return nil
+		}
 		return fmt.Errorf("cannot get ServingGroupList from store, err:%v", err)
 	}
 
@@ -1503,12 +1480,12 @@ func (c *ModelServingController) deleteOutdatedRoles(
 	// Iterate from end to start to delete largest ordinals first.
 	for i := len(groups) - 1; i >= 0; i-- {
 		sg := groups[i]
-		rolesToDelete, hasOutdatedRoles, err := c.rolesToDeleteForRoleRollingUpdate(ms, sg)
+		rolesToDelete, hasOutdatedRoles, err := c.rolesToDeleteForRoleRollingUpdate(ctx, ms, sg)
 		if err != nil {
 			return updateCount, err
 		}
 		if !hasOutdatedRoles {
-			c.updateServingGroupRevisionIfNoOutdatedRoles(ms, sg.Name, revision)
+			c.updateServingGroupRevisionIfNoOutdatedRoles(ctx, ms, sg.Name, revision)
 			continue
 		}
 		if len(rolesToDelete) == 0 {
@@ -1524,7 +1501,34 @@ func (c *ModelServingController) deleteOutdatedRoles(
 	return updateCount, nil
 }
 
-func (c *ModelServingController) updateServingGroupRevisionIfNoOutdatedRoles(ms *workloadv1alpha1.ModelServing, groupName, revision string) {
+func (c *ModelServingController) updateServingGroupRevisionIfNoOutdatedRoles(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName, revision string) {
+	roles, err := c.store.GetRolesByGroup(utils.GetNamespaceName(ms), groupName)
+	if err != nil {
+		return
+	}
+	roleSpecByName := make(map[string]workloadv1alpha1.Role, len(ms.Spec.Template.Roles))
+	for _, role := range ms.Spec.Template.Roles {
+		roleSpecByName[role.Name] = role
+	}
+	for roleName, instances := range roles {
+		for _, role := range instances {
+			if role == nil || role.Status == datastore.RoleDeleting || role.Revision == "" || role.Revision == revision {
+				continue
+			}
+			targetRole, ok := roleSpecByName[roleName]
+			if !ok {
+				continue
+			}
+			outdated, err := c.roleNeedsUpdate(ctx, ms, datastore.ServingGroup{Name: groupName}, targetRole, *role)
+			if err != nil {
+				klog.Errorf("failed to compare role revision %s: %v", role.Revision, err)
+				return
+			}
+			if outdated {
+				return
+			}
+		}
+	}
 	if err := c.store.UpdateServingGroupRevision(utils.GetNamespaceName(ms), groupName, revision); err != nil {
 		klog.Errorf("failed to update ServingGroup %s revision: %v", groupName, err)
 		return
@@ -1537,7 +1541,7 @@ type roleToDelete struct {
 	roleID   string
 }
 
-func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ms *workloadv1alpha1.ModelServing, sg datastore.ServingGroup) ([]roleToDelete, bool, error) {
+func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ctx context.Context, ms *workloadv1alpha1.ModelServing, sg datastore.ServingGroup) ([]roleToDelete, bool, error) {
 	roleSpecByName := make(map[string]workloadv1alpha1.Role, len(ms.Spec.Template.Roles))
 	for _, role := range ms.Spec.Template.Roles {
 		roleSpecByName[role.Name] = role
@@ -1556,7 +1560,10 @@ func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ms *workloadv
 			return nil, false, fmt.Errorf("failed to get roles for ServingGroup %s, role %s: %v", sg.Name, roleSpec.Name, err)
 		}
 
-		outdatedRoles, newUnavailable := c.outdatedRoles(ms, sg, roleSpec, roleList)
+		outdatedRoles, newUnavailable, err := c.outdatedRoles(ctx, ms, sg, roleSpec, roleList)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to compare roles for ServingGroup %s, role %s: %v", sg.Name, roleSpec.Name, err)
+		}
 		partition, partitionConfigured, partitionErr := c.getPartition(rolePartition(ms, roleSpec), roleReplicas(roleSpec))
 		if partitionErr != nil {
 			return nil, false, fmt.Errorf("failed to parse partition for role %s: %v", roleSpec.Name, partitionErr)
@@ -1566,6 +1573,9 @@ func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ms *workloadv
 			for i := 0; i < partition && i < len(roleList); i++ {
 				protected.Insert(roleList[i].Name)
 			}
+		}
+		if len(outdatedRoles) > 0 {
+			hasOutdatedRoles = true
 		}
 		if len(protected) > 0 && len(outdatedRoles) > 0 {
 			filtered := outdatedRoles[:0]
@@ -1578,25 +1588,8 @@ func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ms *workloadv
 			outdatedRoles = filtered
 		}
 		if len(outdatedRoles) == 0 {
-			if len(protected) > 0 {
-				expectedHash := utils.CalRoleTemplateHash(roleSpec)
-				for _, role := range roleList {
-					if !protected.Has(role.Name) {
-						continue
-					}
-					if role.Status == datastore.RoleDeleting {
-						continue
-					}
-					observedHash, ok := c.resolveRoleTemplateHashForComparison(ms, sg, roleSpec.Name, role)
-					if ok && observedHash != expectedHash {
-						hasOutdatedRoles = true
-						break
-					}
-				}
-			}
 			continue
 		}
-		hasOutdatedRoles = true
 		maxScaleDown, err := calMaxScaleDown(roleSpec, outdatedRoles, len(roleList), newUnavailable)
 		if err != nil {
 			klog.Errorf("failed to calculate maxScaleDown for role %s in ServingGroup %s: %v", roleSpec.Name, sg.Name, err)
@@ -1626,8 +1619,7 @@ func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ms *workloadv
 	return rolesToDelete, hasOutdatedRoles, nil
 }
 
-func (c *ModelServingController) outdatedRoles(ms *workloadv1alpha1.ModelServing, sg datastore.ServingGroup, roleSpec workloadv1alpha1.Role, roleList []datastore.Role) ([]datastore.Role, int) {
-	expectedHash := utils.CalRoleTemplateHash(roleSpec)
+func (c *ModelServingController) outdatedRoles(ctx context.Context, ms *workloadv1alpha1.ModelServing, sg datastore.ServingGroup, roleSpec workloadv1alpha1.Role, roleList []datastore.Role) ([]datastore.Role, int, error) {
 	outdatedRoles := make([]datastore.Role, 0, len(roleList))
 	// record the number of roles that is in rollingupdate but not ready yet.
 	newUnavailable := 0
@@ -1636,12 +1628,11 @@ func (c *ModelServingController) outdatedRoles(ms *workloadv1alpha1.ModelServing
 			newUnavailable++
 			continue
 		}
-		observedHash, ok := c.resolveRoleTemplateHashForComparison(ms, sg, roleSpec.Name, role)
-		if !ok {
-			klog.Warningf("skip outdated check for role %s/%s in ServingGroup %s because roleTemplateHash is missing and cannot be inferred", roleSpec.Name, role.Name, sg.Name)
-			continue
+		outdated, err := c.roleNeedsUpdate(ctx, ms, sg, roleSpec, role)
+		if err != nil {
+			return nil, 0, err
 		}
-		if observedHash != expectedHash {
+		if outdated {
 			outdatedRoles = append(outdatedRoles, role)
 		} else if role.Status != datastore.RoleRunning {
 			newUnavailable++
@@ -1659,7 +1650,59 @@ func (c *ModelServingController) outdatedRoles(ms *workloadv1alpha1.ModelServing
 		_, bOrdinal := utils.GetParentNameAndOrdinal(b.Name)
 		return cmp.Compare(bOrdinal, aOrdinal)
 	})
-	return outdatedRoles, newUnavailable
+	return outdatedRoles, newUnavailable, nil
+}
+
+// roleNeedsUpdate compares a live Role with the canonical revision inputs that
+// apply to that Role. Legacy revisions are always outdated so the one-time v1
+// migration follows the normal rollout strategy. A Role with a revision identity
+// is conservatively outdated when its history cannot be read. Legacy roles use
+// RoleTemplateHash only when it is available; unknown identity is outdated.
+func (c *ModelServingController) roleNeedsUpdate(
+	ctx context.Context,
+	ms *workloadv1alpha1.ModelServing,
+	sg datastore.ServingGroup,
+	targetRole workloadv1alpha1.Role,
+	role datastore.Role,
+) (bool, error) {
+	expected, err := utils.RoleRevisionHash(ms, targetRole.Name)
+	if err != nil {
+		return false, fmt.Errorf("build desired revision identity for role %s: %w", targetRole.Name, err)
+	}
+
+	revision := role.Revision
+	if revision == "" {
+		revision = sg.Revision
+	}
+	if revision != "" {
+		if c == nil || c.kubeClientSet == nil {
+			return true, nil
+		}
+		cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revision)
+		if err != nil {
+			return false, fmt.Errorf("get ControllerRevision %s: %w", revision, err)
+		}
+		if cr == nil {
+			// A RoleTemplateHash only describes the Role. It cannot prove that
+			// ModelServing-level revisioned inputs (such as schedulerName or
+			// plugins) still match when the referenced history is gone.
+			return true, nil
+		}
+		if cr.Annotations[utils.ControllerRevisionDataVersionAnnotation] == utils.ControllerRevisionDataVersionV1 {
+			observed, err := utils.RoleRevisionHashFromRevisionData(cr.Data.Raw, targetRole.Name)
+			if err != nil {
+				return false, fmt.Errorf("build revision identity for Role %s from ControllerRevision %s: %w", targetRole.Name, cr.Name, err)
+			}
+			return observed != expected, nil
+		}
+		return true, nil
+	}
+
+	if role.RoleTemplateHash == "" {
+		klog.Warningf("treat legacy role %s/%s in ServingGroup %s as outdated because its identity is missing", targetRole.Name, role.Name, sg.Name)
+		return true, nil
+	}
+	return role.RoleTemplateHash != utils.CalRoleTemplateHash(targetRole), nil
 }
 
 func selectOutdatedRolesToDelete(roleName string, outdatedRoles []datastore.Role, maxScaleDown int) ([]roleToDelete, error) {
@@ -1887,7 +1930,7 @@ func (c *ModelServingController) handleDeletedPod(ms *workloadv1alpha1.ModelServ
 
 func (c *ModelServingController) checkServingGroupReady(ms *workloadv1alpha1.ModelServing, servingGroupName string) (bool, error) {
 	klog.V(4).Infof("checkServingGroupReady: modelServing=%s/%s, servingGroup=%s", ms.Namespace, ms.Name, servingGroupName)
-	roles, err := c.rolesForServingGroupReadiness(ms, servingGroupName)
+	roles, err := c.rolesForServingGroupReadiness(ms)
 	if err != nil {
 		return false, err
 	}
@@ -1896,9 +1939,9 @@ func (c *ModelServingController) checkServingGroupReady(ms *workloadv1alpha1.Mod
 		if err != nil {
 			return false, err
 		}
-		if len(roleList) != int(*role.Replicas) {
+		if len(roleList) != roleReplicas(role) {
 			klog.V(4).Infof("checkServingGroupReady: role %s in group %s not ready: replica count mismatch (%d/%d)",
-				role.Name, servingGroupName, len(roleList), int(*role.Replicas))
+				role.Name, servingGroupName, len(roleList), roleReplicas(role))
 			return false, nil
 		}
 		for _, r := range roleList {
@@ -1922,7 +1965,7 @@ func (c *ModelServingController) checkRoleReady(ms *workloadv1alpha1.ModelServin
 	}
 	// Find the role specification to get expected pod count. A partition-
 	// protected ServingGroup keeps the template from its own revision.
-	roles, err := c.rolesForServingGroupReadiness(ms, servingGroupName)
+	roles, err := c.rolesForServingGroupReadiness(ms)
 	if err != nil {
 		return false, err
 	}
@@ -1961,56 +2004,15 @@ func (c *ModelServingController) checkRoleReady(ms *workloadv1alpha1.ModelServin
 	return true, nil
 }
 
-// rolesForServingGroupReadiness returns the Role templates that should be used
-// to evaluate the readiness of a ServingGroup. RoleRollingUpdate always uses
-// the current templates because Roles are updated independently. During a
-// ServingGroupRollingUpdate, a partition-protected ServingGroup may still run
-// an older revision whose replica counts and pod layout differ from the current
-// spec, so its templates are loaded from the corresponding ControllerRevision.
-func (c *ModelServingController) rolesForServingGroupReadiness(ms *workloadv1alpha1.ModelServing, servingGroupName string) ([]workloadv1alpha1.Role, error) {
-	if ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.Type == workloadv1alpha1.RoleRollingUpdate {
-		return ms.Spec.Template.Roles, nil
-	}
-	partition, _, err := c.getPartition(modelServingPartition(ms), modelServingReplicas(ms))
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve partition for ServingGroup %s: %v", servingGroupName, err)
-	}
-	if partition <= 0 {
-		return ms.Spec.Template.Roles, nil
-	}
-	servingGroups, err := c.store.GetServingGroupByModelServing(utils.GetNamespaceName(ms))
-	if err != nil {
-		if errors.Is(err, datastore.ErrServingGroupNotFound) {
-			return ms.Spec.Template.Roles, nil
-		}
-		return nil, fmt.Errorf("failed to get ServingGroups for readiness: %v", err)
-	}
-	groupIndex := -1
-	for index, group := range servingGroups {
-		if group.Name == servingGroupName {
-			groupIndex = index
-			break
-		}
-	}
-	if groupIndex < 0 || groupIndex >= partition {
-		return ms.Spec.Template.Roles, nil
-	}
-	revision, ok := c.store.GetServingGroupRevision(utils.GetNamespaceName(ms), servingGroupName)
-	if !ok || revision == "" || revision == utils.ModelServingRevision(ms) {
-		return ms.Spec.Template.Roles, nil
-	}
-	cr, err := utils.GetControllerRevision(context.Background(), c.kubeClientSet, ms, revision)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get ControllerRevision %s for ServingGroup %s: %v", revision, servingGroupName, err)
-	}
-	if cr == nil {
-		return nil, fmt.Errorf("ControllerRevision %s for ServingGroup %s was not found", revision, servingGroupName)
-	}
-	roles, err := utils.GetRolesFromControllerRevision(cr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read ControllerRevision %s for ServingGroup %s: %v", revision, servingGroupName, err)
-	}
-	return roles, nil
+// rolesForServingGroupReadiness returns the current Role templates used to
+// evaluate readiness. Historical data is only loaded when a missing protected
+// resource must be recreated.
+func (c *ModelServingController) rolesForServingGroupReadiness(ms *workloadv1alpha1.ModelServing) ([]workloadv1alpha1.Role, error) {
+	// Readiness observes the existing workload. It must not require a
+	// historical ControllerRevision merely because the ServingGroup is old;
+	// historical data is only needed when a missing protected resource is
+	// recreated.
+	return ms.Spec.Template.Roles, nil
 }
 
 func (c *ModelServingController) isServingGroupOutdated(group datastore.ServingGroup, namespace, newRevision string) bool {
@@ -2240,12 +2242,14 @@ func (c *ModelServingController) getPodGroupsByIndex(indexName, indexValue strin
 }
 
 // UpdateModelServingStatus update replicas in modelServing status.
-func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.ModelServing, revision string) error {
+func (c *ModelServingController) UpdateModelServingStatus(ctx context.Context, ms *workloadv1alpha1.ModelServing, revision string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Get latest modelserving from informer store
-		latestMS, getErr := c.modelServingLister.ModelServings(ms.Namespace).Get(ms.Name)
+		latestMS, getErr := c.modelServingClient.WorkloadV1alpha1().ModelServings(ms.Namespace).Get(ctx, ms.Name, metav1.GetOptions{})
 		if getErr != nil {
 			return getErr
+		}
+		if latestMS.Generation != ms.Generation {
+			return fmt.Errorf("ModelServing generation changed from %d to %d during reconciliation", ms.Generation, latestMS.Generation)
 		}
 
 		// Calculate status based on latestMS
@@ -2254,6 +2258,10 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 			// If no groups exist, handle gracefully by setting revisions to the new revision
 			if errors.Is(err, datastore.ErrServingGroupNotFound) {
 				copy := latestMS.DeepCopy()
+				revisionReferences, refsErr := c.revisionReferencesForStatus(latestMS, nil, modelServingReplicas(latestMS) > 0)
+				if refsErr != nil {
+					return refsErr
+				}
 				selectorSet := labels.Set{
 					workloadv1alpha1.ModelServingNameLabelKey: latestMS.Name,
 					workloadv1alpha1.EntryLabelKey:            utils.Entry,
@@ -2264,15 +2272,23 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 					selectorSet[workloadv1alpha1.RoleIDKey] = utils.GenerateRoleID(roleName, 0)
 				}
 				selector := selectorSet.String()
-				needsUpdate := copy.Status.CurrentRevision != revision || copy.Status.UpdateRevision != revision || copy.Status.LabelSelector != selector
+				collisionCount := latestCollisionCount(copy.Status.CollisionCount, ms.Status.CollisionCount)
+				needsUpdate := copy.Status.CurrentRevision != revision || copy.Status.UpdateRevision != revision ||
+					copy.Status.LabelSelector != selector || !reflect.DeepEqual(copy.Status.CollisionCount, collisionCount) ||
+					!reflect.DeepEqual(copy.Status.RevisionReferences, revisionReferences)
 				if needsUpdate {
 					copy.Status.CurrentRevision = revision
 					copy.Status.UpdateRevision = revision
 					copy.Status.LabelSelector = selector
-					_, updateErr := c.modelServingClient.WorkloadV1alpha1().ModelServings(copy.GetNamespace()).UpdateStatus(context.TODO(), copy, metav1.UpdateOptions{})
-					return updateErr
+					copy.Status.CollisionCount = collisionCount
+					copy.Status.RevisionReferences = revisionReferences
+					updated, updateErr := c.modelServingClient.WorkloadV1alpha1().ModelServings(copy.GetNamespace()).UpdateStatus(ctx, copy, metav1.UpdateOptions{})
+					if updateErr != nil {
+						return updateErr
+					}
+					copy = updated
 				}
-				return nil
+				return utils.CleanupOldControllerRevisions(ctx, c.kubeClientSet, copy)
 			}
 			return err
 		}
@@ -2286,14 +2302,10 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 		progressingGroups, updatedGroups, currentGroups := []int{}, []int{}, []int{}
 		// Track revision counts to determine the most common non-updated revision (CurrentRevision)
 		revisionCount := make(map[string]int)
-		referencedRevisions := make([]string, 0, len(groups))
 		rolloutActive := hasUpdateableOutdatedServingGroup(groups, revision, partition)
 		for index := range groups {
 			group := groups[index]
 			_, ordinal := utils.GetParentNameAndOrdinal(group.Name)
-			if group.Revision != "" {
-				referencedRevisions = append(referencedRevisions, group.Revision)
-			}
 			if group.Status == datastore.ServingGroupDeleting {
 				// Scaling -> Running or
 				// Creating -> Running
@@ -2341,6 +2353,10 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 		updateRevision := revision
 		var currentRevision string
 		rolloutComplete := updated == replicas && available == replicas && len(groups) == replicas
+		revisionReferences, refsErr := c.revisionReferencesForStatus(latestMS, groups, progressActive)
+		if refsErr != nil {
+			return refsErr
+		}
 
 		// First, try to use existing CurrentRevision from status if it's still valid
 		if copy.Status.CurrentRevision != "" {
@@ -2398,12 +2414,19 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 			copy.Status.CurrentReplicas = int32(current)
 		}
 
-		revisionUpdated := false
 		if copy.Status.CurrentRevision != currentRevision || copy.Status.UpdateRevision != updateRevision {
 			shouldUpdate = true
-			revisionUpdated = true
 			copy.Status.CurrentRevision = currentRevision
 			copy.Status.UpdateRevision = updateRevision
+		}
+		collisionCount := latestCollisionCount(copy.Status.CollisionCount, ms.Status.CollisionCount)
+		if !reflect.DeepEqual(copy.Status.CollisionCount, collisionCount) {
+			shouldUpdate = true
+			copy.Status.CollisionCount = collisionCount
+		}
+		if !reflect.DeepEqual(copy.Status.RevisionReferences, revisionReferences) {
+			shouldUpdate = true
+			copy.Status.RevisionReferences = revisionReferences
 		}
 
 		if copy.Spec.RolloutStrategy == nil || copy.Spec.RolloutStrategy.RollingUpdateConfiguration == nil || copy.Spec.RolloutStrategy.RollingUpdateConfiguration.Partition == nil {
@@ -2444,20 +2467,82 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 		}
 
 		if shouldUpdate {
-			_, err := c.modelServingClient.WorkloadV1alpha1().ModelServings(copy.GetNamespace()).UpdateStatus(context.TODO(), copy, metav1.UpdateOptions{})
+			updated, err := c.modelServingClient.WorkloadV1alpha1().ModelServings(copy.GetNamespace()).UpdateStatus(ctx, copy, metav1.UpdateOptions{})
 			if err != nil {
 				return err
 			}
-			// Clean up old revisions only after roles have been updated (revision status changed)
-			if revisionUpdated {
-				if cleanupErr := utils.CleanupOldControllerRevisions(context.TODO(), c.kubeClientSet, copy, referencedRevisions...); cleanupErr != nil {
-					klog.Warningf("Failed to cleanup old ControllerRevisions after updating revision status for ModelServing %s/%s: %v", copy.Namespace, copy.Name, cleanupErr)
+			copy = updated
+		}
+
+		return utils.CleanupOldControllerRevisions(ctx, c.kubeClientSet, copy)
+	})
+}
+
+func copyInt32Pointer(value *int32) *int32 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func latestCollisionCount(current, desired *int32) *int32 {
+	if current != nil && (desired == nil || *current > *desired) {
+		return copyInt32Pointer(current)
+	}
+	return copyInt32Pointer(desired)
+}
+
+// revisionReferencesForStatus records every ControllerRevision still needed by
+// observed child state. CurrentRevision and UpdateRevision are already protected
+// separately by GC; copying them here would retain unused superseded targets.
+// Retain previous references while replacements are
+// incomplete, including across Pod deletion and controller restart. A healthy
+// partitioned rollout can release stale references without updating every replica.
+func (c *ModelServingController) revisionReferencesForStatus(
+	ms *workloadv1alpha1.ModelServing,
+	groups []datastore.ServingGroup,
+	retainExisting bool,
+) ([]string, error) {
+	references := make(map[string]struct{})
+	add := func(revision string) {
+		if revision != "" {
+			references[revision] = struct{}{}
+		}
+	}
+	if retainExisting {
+		for _, revision := range ms.Status.RevisionReferences {
+			add(revision)
+		}
+	}
+
+	for _, group := range groups {
+		add(group.Revision)
+		if c.store == nil {
+			continue
+		}
+		roles, err := c.store.GetRolesByGroup(utils.GetNamespaceName(ms), group.Name)
+		if err != nil {
+			if errors.Is(err, datastore.ErrServingGroupNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to get roles for revision references in ServingGroup %s: %w", group.Name, err)
+		}
+		for _, roleMap := range roles {
+			for _, role := range roleMap {
+				if role != nil {
+					add(role.Revision)
 				}
 			}
 		}
+	}
 
-		return nil
-	})
+	result := make([]string, 0, len(references))
+	for revision := range references {
+		result = append(result, revision)
+	}
+	slices.Sort(result)
+	return result, nil
 }
 
 // getPartition resolves an absolute partition from the configuration selected
@@ -2699,9 +2784,9 @@ func (c *ModelServingController) buildPluginChain(ms *workloadv1alpha1.ModelServ
 	return plugins.NewChain(c.pluginsRegistry, ms.Spec.Plugins)
 }
 
-func (c *ModelServingController) CreatePodsForServingGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupIndex int, revision string, roles []workloadv1alpha1.Role) error {
+func (c *ModelServingController) CreatePodsForServingGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupIndex int, revision string) error {
 	servingGroupName := utils.GenerateServingGroupName(ms.Name, servingGroupIndex)
-	for _, role := range roles {
+	for _, role := range ms.Spec.Template.Roles {
 		roleTemplateHash := utils.CalRoleTemplateHash(role)
 		replicas := int(*role.Replicas)
 		for i := 0; i < replicas; i++ {
@@ -2721,8 +2806,6 @@ func (c *ModelServingController) CreatePodsForServingGroup(ctx context.Context, 
 
 func (c *ModelServingController) CreatePodsByRole(ctx context.Context, role workloadv1alpha1.Role, ms *workloadv1alpha1.ModelServing, roleIndex int, servingGroupOrdinal int, revision string, roleTemplateHash string) error {
 	servingGroupName := utils.GenerateServingGroupName(ms.Name, servingGroupOrdinal)
-	// TODO(hzxuzhonghu): build the plugin chain only once per ModelServing
-	// This is not critical now, so we leave it for future optimization.
 	chain, err := c.buildPluginChain(ms)
 	if err != nil {
 		return fmt.Errorf("build plugin chain: %w", err)
@@ -2731,7 +2814,7 @@ func (c *ModelServingController) CreatePodsByRole(ctx context.Context, role work
 	entryPod := utils.GenerateEntryPod(role, ms, servingGroupName, roleID, revision, roleTemplateHash)
 	taskName := c.podGroupManager.GenerateTaskName(role.Name, roleIndex)
 	c.podGroupManager.AnnotatePodWithPodGroup(entryPod, ms, servingGroupName, taskName)
-	if err := c.createPod(ctx, ms, servingGroupName, role.Name, roleID, entryPod, true, chain, "entry"); err != nil {
+	if err := c.createPod(ctx, ms, servingGroupName, role.Name, roleID, revision, roleTemplateHash, entryPod, true, chain, "entry"); err != nil {
 		return err
 	}
 	if role.WorkerReplicas > 0 && role.WorkerTemplate == nil {
@@ -2742,7 +2825,7 @@ func (c *ModelServingController) CreatePodsByRole(ctx context.Context, role work
 	for i := 1; i <= int(role.WorkerReplicas); i++ {
 		workerPod := utils.GenerateWorkerPod(role, ms, entryPod, servingGroupName, roleID, i, revision, roleTemplateHash)
 		c.podGroupManager.AnnotatePodWithPodGroup(workerPod, ms, servingGroupName, taskName)
-		if err := c.createPod(ctx, ms, servingGroupName, role.Name, roleID, workerPod, false, chain, "worker"); err != nil {
+		if err := c.createPod(ctx, ms, servingGroupName, role.Name, roleID, revision, roleTemplateHash, workerPod, false, chain, "worker"); err != nil {
 			return err
 		}
 	}
@@ -2755,6 +2838,8 @@ func (c *ModelServingController) createPod(
 	servingGroupName string,
 	roleName string,
 	roleID string,
+	revision string,
+	roleTemplateHash string,
 	pod *corev1.Pod,
 	isEntry bool,
 	chain *plugins.Chain,
@@ -2773,6 +2858,7 @@ func (c *ModelServingController) createPod(
 			return fmt.Errorf("execute OnPodCreate failed for %s pod %s: %v", roleKind, pod.Name, err)
 		}
 	}
+	utils.RestoreControllerOwnedPodMetadata(pod, ms, servingGroupName, roleName, roleID, isEntry, revision, roleTemplateHash)
 
 	_, err := c.kubeClientSet.CoreV1().Pods(ms.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
@@ -2892,12 +2978,13 @@ func (c *ModelServingController) createOrUpdatePodGroupByServingGroup(ctx contex
 	return nil
 }
 
-// resolveRoleTemplateHash resolves role template hash from labels first.
-// For legacy pods without roleTemplateHash label, fallback to:
+// resolveRoleTemplateHash resolves roleTemplateHash from labels first. For a
+// legacy label, fallback to:
 // 1. get pod revision from labels
 // 2. find corresponding ControllerRevision
 // 3. hash the matched role from ControllerRevision
-// If any step fails, return empty string and let rolling update handle reconciliation.
+// If any step fails, retain the stored label and let rolling update handle
+// reconciliation conservatively.
 func (c *ModelServingController) resolveRoleTemplateHash(ms *workloadv1alpha1.ModelServing, roleName string, obj metav1.Object) string {
 	roleTemplateHash := utils.ObjectRoleTemplateHash(obj)
 	if roleTemplateHash != "" {
@@ -2943,6 +3030,9 @@ func (c *ModelServingController) resolveRoleTemplateHashFromRevision(ms *workloa
 		return "", false
 	}
 
+	if !metav1.IsControlledBy(cr, ms) {
+		return "", false
+	}
 	roles, err := utils.GetRolesFromControllerRevision(cr)
 	if err != nil {
 		klog.Warningf("failed to parse roles from ControllerRevision %s for ModelServing %s/%s: %v", revision, ms.Namespace, ms.Name, err)
@@ -2958,22 +3048,23 @@ func (c *ModelServingController) resolveRoleTemplateHashFromRevision(ms *workloa
 	return "", false
 }
 
-// resolveRoleTemplateHashForComparison resolves role template hash used for outdated-role comparison.
-// Priority:
-// 1. Use hash stored in datastore role directly.
-// 2. If missing (legacy data), infer from the ServingGroup's ControllerRevision.
-// Returns (hash, true) when hash is resolved, otherwise ("", false).
-func (c *ModelServingController) resolveRoleTemplateHashForComparison(
+func (c *ModelServingController) modelServingForRevision(
+	ctx context.Context,
 	ms *workloadv1alpha1.ModelServing,
-	servingGroup datastore.ServingGroup,
-	roleName string,
-	role datastore.Role,
-) (string, bool) {
-	if role.RoleTemplateHash != "" {
-		return role.RoleTemplateHash, true
+	revision string,
+) (*workloadv1alpha1.ModelServing, error) {
+	cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revision)
+	if err != nil {
+		return nil, fmt.Errorf("get ControllerRevision: %w", err)
 	}
-
-	return c.resolveRoleTemplateHashFromRevision(ms, servingGroup.Revision, roleName)
+	if cr == nil {
+		return nil, errControllerRevisionNotFound
+	}
+	workload, err := utils.ModelServingForControllerRevision(ms, cr)
+	if err != nil {
+		return nil, fmt.Errorf("apply ControllerRevision %s: %w", cr.Name, err)
+	}
+	return workload, nil
 }
 
 // findOutdatedRolesInServingGroups finds outdated roles in serving groups and returns a map of serving group names to outdated role names
@@ -2981,12 +3072,11 @@ func (c *ModelServingController) resolveRoleTemplateHashForComparison(
 func (c *ModelServingController) findOutdatedRolesInServingGroups(ms *workloadv1alpha1.ModelServing, servingGroups []datastore.ServingGroup, revision string) map[string][]string {
 	outdatedRolesMap := make(map[string][]string)
 
-	// Create a mapping of role name to expected role revision based on current spec
-	expectedroleTemplateHashs := make(map[string]string)
+	// Create a mapping of role name to the current role specification.
+	roleSpecByName := make(map[string]workloadv1alpha1.Role, len(ms.Spec.Template.Roles))
 	newRoleNames := make(map[string]bool)
 	for _, role := range ms.Spec.Template.Roles {
-		roleTemplateHash := utils.CalRoleTemplateHash(role)
-		expectedroleTemplateHashs[role.Name] = roleTemplateHash
+		roleSpecByName[role.Name] = role
 		newRoleNames[role.Name] = true
 	}
 
@@ -2994,7 +3084,7 @@ func (c *ModelServingController) findOutdatedRolesInServingGroups(ms *workloadv1
 		var outdatedRoleNames []string
 
 		// Check each role in the current serving group
-		for roleName, roleTemplateHash := range expectedroleTemplateHashs {
+		for roleName, roleSpec := range roleSpecByName {
 			// Get a safe copy of the roles list from the store to avoid concurrent map iteration/write.
 			roles, err := c.store.GetRoleList(utils.GetNamespaceName(ms), sg.Name, roleName)
 			if err != nil {
@@ -3005,16 +3095,15 @@ func (c *ModelServingController) findOutdatedRolesInServingGroups(ms *workloadv1
 			// Check if any instance of this role type is outdated
 			hasOutdatedRole := false
 			for _, role := range roles {
-				observedRoleTemplateHash, ok := c.resolveRoleTemplateHashForComparison(ms, sg, roleName, role)
-				if !ok {
-					// Legacy upgrade compatibility: missing roleTemplateHash should not trigger forced restart
-					// when we cannot safely infer historical template.
-					klog.Warningf("skip outdated check for role %s/%s in ServingGroup %s because roleTemplateHash is missing and cannot be inferred", roleName, role.Name, sg.Name)
+				if role.Status == datastore.RoleDeleting {
 					continue
 				}
-				// If the role revision in the store is different from the expected revision and
-				// the role is not already being deleted, it's outdated
-				if observedRoleTemplateHash != roleTemplateHash && role.Status != datastore.RoleDeleting {
+				outdated, err := c.roleNeedsUpdate(context.Background(), ms, sg, roleSpec, role)
+				if err != nil {
+					klog.Errorf("failed to compare role %s/%s in ServingGroup %s: %v", roleName, role.Name, sg.Name, err)
+					continue
+				}
+				if outdated {
 					hasOutdatedRole = true
 					break
 				}
@@ -3043,13 +3132,7 @@ func (c *ModelServingController) findOutdatedRolesInServingGroups(ms *workloadv1
 			// There are outdated roles in this serving group
 			outdatedRolesMap[sg.Name] = outdatedRoleNames
 		} else {
-			// No outdated roles in this serving group, update its revision in the store
-			err := c.store.UpdateServingGroupRevision(utils.GetNamespaceName(ms), sg.Name, revision)
-			if err != nil {
-				klog.Errorf("failed to update ServingGroup %s revision: %v", sg.Name, err)
-			} else {
-				klog.V(2).Infof("Updated ServingGroup %s revision to latest: %s", sg.Name, revision)
-			}
+			c.updateServingGroupRevisionIfNoOutdatedRoles(context.Background(), ms, sg.Name, revision)
 		}
 	}
 
