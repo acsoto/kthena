@@ -991,11 +991,11 @@ func (c *ModelServingController) scaleDownRoles(ctx context.Context, ms *workloa
 	}
 }
 
-// scaleUpRoles fills missing Role ordinals in [0, expectedCount). A
-// partition-protected historical group uses its recorded revision; otherwise
-// missing ordinals below a RoleRollingUpdate partition use CurrentRevision and
-// the rest use newRevision.
-func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName string, targetRole workloadv1alpha1.Role, roleList []datastore.Role, expectedCount int, servingGroupOrdinal int, newRevision string, historicalGroup bool, recoveryWorkload *workloadv1alpha1.ModelServing) error {
+// scaleUpRoles fills missing Role ordinals in [0, expectedCount). A non-nil
+// recoveryWorkload uses its recorded historical revision; otherwise missing
+// ordinals below a RoleRollingUpdate partition use CurrentRevision and the
+// rest use newRevision.
+func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName string, targetRole workloadv1alpha1.Role, roleList []datastore.Role, expectedCount int, servingGroupOrdinal int, newRevision string, recoveryWorkload *workloadv1alpha1.ModelServing) error {
 	partition, partitionConfigured, partitionErr := c.getPartition(rolePartition(ms, targetRole), roleReplicas(targetRole))
 	if partitionErr != nil {
 		return fmt.Errorf("parse partition for role %s: %w", targetRole.Name, partitionErr)
@@ -1038,10 +1038,10 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 	roleTemplateHash := utils.CalRoleTemplateHash(targetRole)
 	var scaleUpErr error
 	forEachMissingOrdinal(expectedCount, existingOrdinals, toCreate, func(ordinal int) bool {
-		if historicalGroup || (partitionConfigured && partition > 0 && ordinal < partition) {
+		if recoveryWorkload != nil || (partitionConfigured && partition > 0 && ordinal < partition) {
 			// Use CurrentRevision for partition-protected ordinals
 			revisionToUse := newRevision
-			if historicalGroup {
+			if recoveryWorkload != nil {
 				if groupRevision, ok := c.store.GetServingGroupRevision(utils.GetNamespaceName(ms), groupName); ok && groupRevision != "" {
 					revisionToUse = groupRevision
 				} else if ms.Status.CurrentRevision != "" {
@@ -1055,9 +1055,9 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 			klog.V(4).Infof("scaleUpRoles: ordinal %d missing (partition-protected), revisionToUse=%s, currentRevision=%s",
 				ordinal, revisionToUse, ms.Status.CurrentRevision)
 
-			workload := recoveryWorkload
-			if workload == nil {
-				workload = ms
+			workload := ms
+			if recoveryWorkload != nil {
+				workload = recoveryWorkload
 			}
 			roleToApply := targetRole
 			if revisionToUse != newRevision {
@@ -1148,7 +1148,7 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 		// are recreated.
 		if len(pods) < expectedPods && !(historicalGroup && recoveryWorkload == nil) {
 			klog.V(2).Infof("manageRoleReplicasPerGroup: role %s/%s in ServingGroup %s is missing pods (%d/%d), recreating", targetRole.Name, roleObj.Name, groupName, len(pods), expectedPods)
-			partitionProtected := historicalGroup || (partitionConfigured && partition > 0 && index < partition)
+			partitionProtected := recoveryWorkload != nil || (partitionConfigured && partition > 0 && index < partition)
 			roleToApply, workloadToApply, replicaRevision, hashToUse, err := c.roleTemplateForReplica(ctx, ms, targetRole, roleObj, desiredRevision, partitionProtected, recoveryWorkload)
 			if err != nil {
 				return fmt.Errorf("resolve workload for role %s/%s: %w", targetRole.Name, roleObj.Name, err)
@@ -1163,7 +1163,19 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 	// Determine whether it is a scale-up or scale-down scenario
 	if len(roleList) < expectedCount {
 		klog.V(2).Infof("manageRoleReplicasPerGroup: scaling UP role %s in ServingGroup %s: current=%d, expected=%d", targetRole.Name, groupName, len(roleList), expectedCount)
-		if err := c.scaleUpRoles(ctx, ms, groupName, targetRole, roleList, expectedCount, servingGroupOrdinal, desiredRevision, historicalGroup, recoveryWorkload); err != nil {
+		if historicalGroup && recoveryWorkload == nil {
+			revisionToUse, ok := c.store.GetServingGroupRevision(utils.GetNamespaceName(ms), groupName)
+			if !ok || revisionToUse == "" || revisionToUse == desiredRevision {
+				revisionToUse = ms.Status.CurrentRevision
+			}
+			if revisionToUse != "" && revisionToUse != desiredRevision {
+				recoveryWorkload, err = c.modelServingForRevision(ctx, ms, revisionToUse)
+				if err != nil {
+					return fmt.Errorf("resolve revision %s for scaling Role %s in ServingGroup %s: %w", revisionToUse, targetRole.Name, groupName, err)
+				}
+			}
+		}
+		if err := c.scaleUpRoles(ctx, ms, groupName, targetRole, roleList, expectedCount, servingGroupOrdinal, desiredRevision, recoveryWorkload); err != nil {
 			return err
 		}
 	} else if len(roleList) > expectedCount {
