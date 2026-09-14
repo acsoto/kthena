@@ -2759,7 +2759,7 @@ func TestManageRoleReplicasWithPartitionProtectedServingGroupAlignsToControllerR
 	controller.store.AddServingGroup(utils.GetNamespaceName(ms), groupOrdinal, oldRevision)
 	controller.store.AddRole(utils.GetNamespaceName(ms), groupName, roleName, utils.GenerateRoleID(roleName, 0), oldRevision, "roleTemplateHash")
 
-	err = controller.syncRoleReplicas(context.Background(), ms, newRevision)
+	err = controller.syncRoleReplicas(context.Background(), ms, newRevision, controller.newRoleUpdateCheck(ms))
 	assert.NoError(t, err)
 
 	roles, err := controller.store.GetRoleList(utils.GetNamespaceName(ms), groupName, roleName)
@@ -2819,7 +2819,7 @@ func TestPartitionProtectedRoleRecoveryFailsWhenControllerRevisionMissing(t *tes
 	key := utils.GetNamespaceName(ms)
 	controller.store.AddServingGroup(key, 0, "revision-a")
 
-	err = controller.syncRoleReplicas(context.Background(), ms, "revision-b")
+	err = controller.syncRoleReplicas(context.Background(), ms, "revision-b", controller.newRoleUpdateCheck(ms))
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "ControllerRevision")
 }
@@ -2915,7 +2915,7 @@ func TestHistoricalRecoveryReadinessUsesRecoveredWorkload(t *testing.T) {
 	f := newProtectedServingGroupFixture(t, "recover-readiness", []workloadv1alpha1.Role{currentRole}, []workloadv1alpha1.Role{historicalRole}, datastore.ServingGroupCreating)
 	roleID := f.addRole(t, "decode")
 
-	require.NoError(t, f.controller.syncRoleReplicas(context.Background(), f.modelServing, f.newRevision))
+	require.NoError(t, f.controller.syncRoleReplicas(context.Background(), f.modelServing, f.newRevision, f.controller.newRoleUpdateCheck(f.modelServing)))
 	pods, err := f.kubeClient.CoreV1().Pods(f.modelServing.Namespace).List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
 	require.Len(t, pods.Items, 1)
@@ -2939,7 +2939,7 @@ func TestProtectedHistoricalServingGroupRoleMembership(t *testing.T) {
 		roleID := f.addRole(t, "decode")
 		f.addEntryPod(t, "decode", roleID)
 
-		require.NoError(t, f.controller.syncRoleReplicas(context.Background(), f.modelServing, f.newRevision))
+		require.NoError(t, f.controller.syncRoleReplicas(context.Background(), f.modelServing, f.newRevision, f.controller.newRoleUpdateCheck(f.modelServing)))
 		roles, err := f.controller.store.GetRoleList(f.key, f.groupName, "prefill")
 		require.NoError(t, err)
 		assert.Empty(t, roles)
@@ -2953,7 +2953,7 @@ func TestProtectedHistoricalServingGroupRoleMembership(t *testing.T) {
 		prefillID := f.addRole(t, "prefill")
 		f.controller.store.DeleteRole(f.key, f.groupName, "prefill", prefillID)
 
-		require.NoError(t, f.controller.syncRoleReplicas(context.Background(), f.modelServing, f.newRevision))
+		require.NoError(t, f.controller.syncRoleReplicas(context.Background(), f.modelServing, f.newRevision, f.controller.newRoleUpdateCheck(f.modelServing)))
 		roles, err := f.controller.store.GetRoleList(f.key, f.groupName, "prefill")
 		require.NoError(t, err)
 		require.Len(t, roles, 1)
@@ -3123,7 +3123,7 @@ func TestManageRoleReplicas(t *testing.T) {
 				assert.NoError(t, controller.podsInformer.GetIndexer().Add(entryPod))
 			}
 
-			controller.manageRoleReplicasPerGroup(context.Background(), ms, groupName, ms.Spec.Template.Roles[0], 0, revision, false, nil)
+			controller.manageRoleReplicasPerGroup(context.Background(), ms, groupName, ms.Spec.Template.Roles[0], 0, revision, false, nil, controller.newRoleUpdateCheck(ms))
 
 			roles, err := controller.store.GetRoleList(utils.GetNamespaceName(ms), groupName, roleName)
 			assert.NoError(t, err)
@@ -3194,7 +3194,7 @@ func TestManageRoleReplicasUsesMaxSurgeDuringRoleRollingUpdate(t *testing.T) {
 		controller.store.AddRole(key, groupName, "decode", utils.GenerateRoleID("decode", ordinal), "old-revision", "old-hash")
 	}
 
-	controller.manageRoleReplicasPerGroup(context.Background(), ms, groupName, ms.Spec.Template.Roles[0], 0, "new-revision", false, nil)
+	controller.manageRoleReplicasPerGroup(context.Background(), ms, groupName, ms.Spec.Template.Roles[0], 0, "new-revision", false, nil, controller.newRoleUpdateCheck(ms))
 
 	roles, err := controller.store.GetRoleList(key, groupName, "decode")
 	require.NoError(t, err)
@@ -3267,7 +3267,7 @@ func TestHasUpdateableOutdatedRole(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, controller.hasUpdateableOutdatedRole(context.Background(), ms, "test-0", targetRole, tt.roles))
+			assert.Equal(t, tt.want, controller.hasUpdateableOutdatedRole(context.Background(), ms, "test-0", targetRole, tt.roles, controller.newRoleUpdateCheck(ms)))
 		})
 	}
 }
@@ -7947,6 +7947,7 @@ func TestDeleteOutdatedServingGroups(t *testing.T) {
 				tt.notRunningOutdatedGroups,
 				tt.runningOutdatedGroups,
 				"v1",
+				controller.newRoleUpdateCheck(ms),
 			)
 
 			assert.NoError(t, err)
@@ -7997,7 +7998,7 @@ func TestServingGroupMaxSurgeRetainedPoolLifecycle(t *testing.T) {
 
 	groups, err := controller.store.GetServingGroupByModelServing(key)
 	require.NoError(t, err)
-	require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new-revision"))
+	require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new-revision", controller.newRoleUpdateCheck(ms)))
 	require.Len(t, groups, 2, "rolling update waits for replica sync to create surge capacity")
 
 	require.NoError(t, controller.syncServingGroupReplicas(context.Background(), ms, "new-revision"))
@@ -8011,13 +8012,13 @@ func TestServingGroupMaxSurgeRetainedPoolLifecycle(t *testing.T) {
 
 	// An unready surge consumes its slot but cannot authorize deletion when
 	// maxUnavailable is zero.
-	require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new-revision"))
+	require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new-revision", controller.newRoleUpdateCheck(ms)))
 	for ordinal := 0; ordinal < 2; ordinal++ {
 		assert.Equal(t, datastore.ServingGroupRunning, controller.store.GetServingGroupStatus(key, utils.GenerateServingGroupName(ms.Name, ordinal)))
 	}
 
 	require.NoError(t, controller.store.UpdateServingGroupStatus(key, surgeName, datastore.ServingGroupRunning))
-	require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new-revision"))
+	require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new-revision", controller.newRoleUpdateCheck(ms)))
 
 	// The highest outdated group is replaced first while the temporary capacity
 	// remains available.
@@ -8028,7 +8029,7 @@ func TestServingGroupMaxSurgeRetainedPoolLifecycle(t *testing.T) {
 	require.NoError(t, controller.syncServingGroupReplicas(context.Background(), ms, "new-revision"))
 	require.NoError(t, controller.store.UpdateServingGroupStatus(key, utils.GenerateServingGroupName(ms.Name, 1), datastore.ServingGroupRunning))
 
-	require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new-revision"))
+	require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new-revision", controller.newRoleUpdateCheck(ms)))
 
 	// Once all remaining groups use the new revision, replica synchronization
 	// derives the normal desired count. The high ordinal remains a normal replica
@@ -8125,7 +8126,7 @@ func TestManageRollingUpdateIncludesSurgeStatusInMaxScaleDown(t *testing.T) {
 				require.NoError(t, controller.store.UpdateServingGroupStatus(key, group.Name, group.Status))
 			}
 
-			require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new"))
+			require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new", controller.newRoleUpdateCheck(ms)))
 			groups, err := controller.store.GetServingGroupByModelServing(key)
 			require.NoError(t, err)
 			outdatedLeft := 0
@@ -8162,7 +8163,7 @@ func TestManageRollingUpdateTreatsServingGroupNotFoundAsEmpty(t *testing.T) {
 	_, err = controller.store.GetServingGroupByModelServing(key)
 	require.ErrorIs(t, err, datastore.ErrServingGroupNotFound)
 
-	assert.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new"))
+	assert.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new", controller.newRoleUpdateCheck(ms)))
 }
 
 func TestHasUpdateableOutdatedServingGroup(t *testing.T) {
@@ -8372,7 +8373,7 @@ func TestExistingOldServingGroupDoesNotRequireHistoricalRevision(t *testing.T) {
 	})
 
 	require.NoError(t, controller.syncServingGroupReplicas(context.Background(), ms, "revision-b"))
-	require.NoError(t, controller.syncRoleReplicas(context.Background(), ms, "revision-b"))
+	require.NoError(t, controller.syncRoleReplicas(context.Background(), ms, "revision-b", controller.newRoleUpdateCheck(ms)))
 	require.NoError(t, controller.syncHeadlessServices(context.Background(), ms, "revision-b"))
 	assert.Zero(t, controllerRevisionGets, "an intact old ServingGroup must not load historical revision data")
 }
@@ -8453,7 +8454,7 @@ func TestServingGroupRollingUpdateIgnoresUnavailableProtectedGroups(t *testing.T
 		controller.store.AddServingGroup(key, group.ordinal, group.revision)
 		require.NoError(t, controller.store.UpdateServingGroupStatus(key, utils.GenerateServingGroupName(ms.Name, group.ordinal), group.status))
 	}
-	require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new"))
+	require.NoError(t, controller.manageRollingUpdate(context.Background(), ms, "new", controller.newRoleUpdateCheck(ms)))
 	assert.Equal(t, datastore.ServingGroupNotFound, controller.store.GetServingGroupStatus(key, utils.GenerateServingGroupName(ms.Name, 2)))
 }
 
@@ -8580,6 +8581,7 @@ func TestDeleteOutdatedRolesForRoleRollingUpdateWithMaxUnavailable(t *testing.T)
 				nil,
 				[]datastore.ServingGroup{{Name: groupName, Revision: oldRevision, Status: datastore.ServingGroupRunning}},
 				newRevision,
+				controller.newRoleUpdateCheck(ms),
 			)
 			require.NoError(t, err)
 
@@ -8881,6 +8883,7 @@ func TestRolesToDeleteForRoleRollingUpdate(t *testing.T) {
 				context.Background(),
 				ms,
 				datastore.ServingGroup{Name: groupName, Revision: revision, Status: datastore.ServingGroupRunning},
+				controller.newRoleUpdateCheck(ms),
 			)
 
 			if tt.expectErrContains != "" {

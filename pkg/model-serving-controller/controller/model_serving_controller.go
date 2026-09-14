@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextClientSet "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -577,13 +578,15 @@ func (c *ModelServingController) syncModelServing(ctx context.Context, key strin
 		return fmt.Errorf("failed to sync ServingGroup replicas: %v", err)
 	}
 
+	needsUpdate := c.newRoleUpdateCheck(ms)
+
 	// 2. Sync the roles and their replicas within each ServingGroup, handling partitioned scaling and revisions.
-	if err := c.syncRoleReplicas(ctx, ms, revision); err != nil {
+	if err := c.syncRoleReplicas(ctx, ms, revision, needsUpdate); err != nil {
 		return fmt.Errorf("failed to sync role replicas: %v", err)
 	}
 
 	// 3. Handle the rolling update process, deleting outdated ServingGroups/Roles to trigger updates.
-	if err := c.manageRollingUpdate(ctx, ms, revision); err != nil {
+	if err := c.manageRollingUpdate(ctx, ms, revision, needsUpdate); err != nil {
 		return fmt.Errorf("failed to handle rollingUpdate: %v", err)
 	}
 
@@ -824,7 +827,7 @@ func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *w
 // 2. Identify if the current ServingGroup falls under the rollout Partition protection.
 // 3. Fallback to an older revision (ControllerRevision) if the group is protected by the partition.
 // 4. Update memory caches and use `manageRoleReplicas` to add/remove out-of-sync Pods and Services for each role.
-func (c *ModelServingController) syncRoleReplicas(ctx context.Context, ms *workloadv1alpha1.ModelServing, newRevision string) error {
+func (c *ModelServingController) syncRoleReplicas(ctx context.Context, ms *workloadv1alpha1.ModelServing, newRevision string, needsUpdate roleUpdateCheck) error {
 	servingGroupList, err := c.store.GetServingGroupByModelServing(utils.GetNamespaceName(ms))
 	if err != nil && !errors.Is(err, datastore.ErrServingGroupNotFound) {
 		return fmt.Errorf("cannot get ServingGroup of modelServing: %s from map: %v", ms.GetName(), err)
@@ -878,7 +881,7 @@ func (c *ModelServingController) syncRoleReplicas(ctx context.Context, ms *workl
 		}
 
 		for _, targetRole := range rolesToManage {
-			if err := c.manageRoleReplicasPerGroup(ctx, ms, servingGroup.Name, targetRole, servingGroupOrdinal, newRevision, historicalGroup, recoveryWorkload); err != nil {
+			if err := c.manageRoleReplicasPerGroup(ctx, ms, servingGroup.Name, targetRole, servingGroupOrdinal, newRevision, historicalGroup, recoveryWorkload, needsUpdate); err != nil {
 				return err
 			}
 		}
@@ -1100,7 +1103,7 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 
 // manageRoleReplicasPerGroup manages the replicas of a specific role within an Serving group
 // It handles both scale up and scale down operations for the role
-func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName string, targetRole workloadv1alpha1.Role, servingGroupOrdinal int, desiredRevision string, historicalGroup bool, recoveryWorkload *workloadv1alpha1.ModelServing) error {
+func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName string, targetRole workloadv1alpha1.Role, servingGroupOrdinal int, desiredRevision string, historicalGroup bool, recoveryWorkload *workloadv1alpha1.ModelServing, needsUpdate roleUpdateCheck) error {
 	// TODO: add podGroup update after gang scheduler finished
 	// Get all replicas of a role from storage, for example, prefill-0, prefill-1...
 	roleList, err := c.store.GetRoleList(utils.GetNamespaceName(ms), groupName, targetRole.Name)
@@ -1110,7 +1113,7 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 
 	expectedCount := roleReplicas(targetRole)
 	if ms.Spec.RolloutStrategy != nil && ms.Spec.RolloutStrategy.Type == workloadv1alpha1.RoleRollingUpdate &&
-		c.hasUpdateableOutdatedRole(ctx, ms, groupName, targetRole, roleList) {
+		c.hasUpdateableOutdatedRole(ctx, ms, groupName, targetRole, roleList, needsUpdate) {
 		maxSurge, err := utils.GetMaxSurgeForRole(targetRole)
 		if err != nil {
 			klog.Errorf("manageRoleReplicasPerGroup: failed to calculate maxSurge for role %s in ServingGroup %s: %v", targetRole.Name, groupName, err)
@@ -1118,7 +1121,6 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 			expectedCount += maxSurge
 		}
 	}
-	expectedPods := 1 + int(targetRole.WorkerReplicas)
 	partition, partitionConfigured, partitionErr := c.getPartition(rolePartition(ms, targetRole), roleReplicas(targetRole))
 	if partitionErr != nil {
 		klog.Errorf("manageRoleReplicasPerGroup: failed to parse partition for role %s: %v", targetRole.Name, partitionErr)
@@ -1146,12 +1148,25 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 		// Do not treat a changed current workerReplicas value as a missing Pod;
 		// deletion handling moves the group into recovery before historical Pods
 		// are recreated.
-		if len(pods) < expectedPods && !(historicalGroup && recoveryWorkload == nil) {
-			klog.V(2).Infof("manageRoleReplicasPerGroup: role %s/%s in ServingGroup %s is missing pods (%d/%d), recreating", targetRole.Name, roleObj.Name, groupName, len(pods), expectedPods)
-			partitionProtected := recoveryWorkload != nil || (partitionConfigured && partition > 0 && index < partition)
-			roleToApply, workloadToApply, replicaRevision, hashToUse, err := c.roleTemplateForReplica(ctx, ms, targetRole, roleObj, desiredRevision, partitionProtected, recoveryWorkload)
+		if historicalGroup && recoveryWorkload == nil {
+			continue
+		}
+		partitionProtected := recoveryWorkload != nil || (partitionConfigured && partition > 0 && index < partition)
+		// Unprotected instances use the current layout. Historical instances
+		// must resolve their layout before deciding whether any Pod is missing.
+		roleToApply, workloadToApply, replicaRevision := targetRole, ms, desiredRevision
+		var hashToUse string
+		if partitionProtected {
+			roleToApply, workloadToApply, replicaRevision, hashToUse, err = c.roleTemplateForReplica(ctx, ms, targetRole, roleObj, desiredRevision, recoveryWorkload)
 			if err != nil {
 				return fmt.Errorf("resolve workload for role %s/%s: %w", targetRole.Name, roleObj.Name, err)
+			}
+		}
+		expectedPods := 1 + int(roleToApply.WorkerReplicas)
+		if len(pods) < expectedPods {
+			klog.V(2).Infof("manageRoleReplicasPerGroup: role %s/%s in ServingGroup %s is missing pods (%d/%d), recreating", targetRole.Name, roleObj.Name, groupName, len(pods), expectedPods)
+			if hashToUse == "" {
+				hashToUse = utils.CalRoleTemplateHash(roleToApply)
 			}
 			_, roleIndex := utils.GetParentNameAndOrdinal(roleObj.Name)
 			if err := c.CreatePodsByRole(ctx, *roleToApply.DeepCopy(), workloadToApply, roleIndex, servingGroupOrdinal, replicaRevision, hashToUse); err != nil {
@@ -1195,6 +1210,7 @@ func (c *ModelServingController) hasUpdateableOutdatedRole(
 	groupName string,
 	targetRole workloadv1alpha1.Role,
 	roleList []datastore.Role,
+	needsUpdate roleUpdateCheck,
 ) bool {
 	partition, _, err := c.getPartition(rolePartition(ms, targetRole), roleReplicas(targetRole))
 	if err != nil {
@@ -1205,7 +1221,7 @@ func (c *ModelServingController) hasUpdateableOutdatedRole(
 		if index < partition || role.Status == datastore.RoleDeleting {
 			continue
 		}
-		outdated, err := c.roleNeedsUpdate(ctx, ms, datastore.ServingGroup{
+		outdated, err := needsUpdate(ctx, datastore.ServingGroup{
 			Name:     groupName,
 			Revision: role.Revision,
 		}, targetRole, role)
@@ -1220,7 +1236,7 @@ func (c *ModelServingController) hasUpdateableOutdatedRole(
 	return false
 }
 
-// roleTemplateForReplica resolves the role template, revision, and hash to use when recreating pods for a replica.
+// roleTemplateForReplica resolves the workload identity of a partition-protected replica.
 // Partition-protected replicas keep the revision recorded on the role (or CurrentRevision) and load the old template from ControllerRevision.
 func (c *ModelServingController) roleTemplateForReplica(
 	ctx context.Context,
@@ -1228,18 +1244,12 @@ func (c *ModelServingController) roleTemplateForReplica(
 	targetRole workloadv1alpha1.Role,
 	roleObj datastore.Role,
 	newRevision string,
-	partitionProtected bool,
 	recoveryWorkload *workloadv1alpha1.ModelServing,
 ) (workloadv1alpha1.Role, *workloadv1alpha1.ModelServing, string, string, error) {
 	roleToApply := targetRole
 	workloadToApply := ms
-	revisionToUse := newRevision
+	revisionToUse := roleObj.Revision
 	hashToUse := ""
-	if !partitionProtected {
-		return roleToApply, workloadToApply, revisionToUse, utils.CalRoleTemplateHash(roleToApply), nil
-	}
-
-	revisionToUse = roleObj.Revision
 	if revisionToUse == "" {
 		revisionToUse = ms.Status.CurrentRevision
 	}
@@ -1395,7 +1405,7 @@ func (c *ModelServingController) DeleteRole(ctx context.Context, ms *workloadv1a
 //  2. Filter outdated groups (mismatched revision) that are allowed to be updated.
 //  3. For ServingGroupRollingUpdate, enforce the ServingGroup-level maxUnavailable budget.
 //  4. For RoleRollingUpdate, update outdated roles using each Role's maxUnavailable budget.
-func (c *ModelServingController) manageRollingUpdate(ctx context.Context, ms *workloadv1alpha1.ModelServing, revision string) error {
+func (c *ModelServingController) manageRollingUpdate(ctx context.Context, ms *workloadv1alpha1.ModelServing, revision string, needsUpdate roleUpdateCheck) error {
 	servingGroupList, err := c.store.GetServingGroupByModelServing(utils.GetNamespaceName(ms))
 	if err != nil {
 		if errors.Is(err, datastore.ErrServingGroupNotFound) {
@@ -1458,7 +1468,7 @@ func (c *ModelServingController) manageRollingUpdate(ctx context.Context, ms *wo
 	}
 
 	// Delete outdated groups or roles according to the selected rollout strategy.
-	updateCount, err := c.deleteOutdatedResourcesForRollingUpdate(ctx, ms, maxScaleDown, notRunningOutdatedGroups, runningOutdatedGroups, revision)
+	updateCount, err := c.deleteOutdatedResourcesForRollingUpdate(ctx, ms, maxScaleDown, notRunningOutdatedGroups, runningOutdatedGroups, revision, needsUpdate)
 	if err != nil {
 		return err
 	}
@@ -1483,6 +1493,7 @@ func (c *ModelServingController) deleteOutdatedResourcesForRollingUpdate(
 	notRunningOutdatedGroups []datastore.ServingGroup,
 	runningOutdatedGroups []datastore.ServingGroup,
 	revision string,
+	needsUpdate roleUpdateCheck,
 ) (int, error) {
 	// Combine all outdated groups.
 	// Delete in descending order by sequence number. Prioritise deletion of servingGroups in notRunning status.
@@ -1493,7 +1504,7 @@ func (c *ModelServingController) deleteOutdatedResourcesForRollingUpdate(
 		return c.deleteOutdatedServingGroups(ctx, ms, maxScaleDown, allOutdatedGroups)
 	}
 
-	return c.deleteOutdatedRoles(ctx, ms, allOutdatedGroups, revision)
+	return c.deleteOutdatedRoles(ctx, ms, allOutdatedGroups, revision, needsUpdate)
 }
 
 // deleteOutdatedServingGroups deletes outdated ServingGroups
@@ -1525,18 +1536,19 @@ func (c *ModelServingController) deleteOutdatedRoles(
 	ms *workloadv1alpha1.ModelServing,
 	groups []datastore.ServingGroup,
 	revision string,
+	needsUpdate roleUpdateCheck,
 ) (int, error) {
 	updateCount := 0
 
 	// Iterate from end to start to delete largest ordinals first.
 	for i := len(groups) - 1; i >= 0; i-- {
 		sg := groups[i]
-		rolesToDelete, hasOutdatedRoles, err := c.rolesToDeleteForRoleRollingUpdate(ctx, ms, sg)
+		rolesToDelete, hasOutdatedRoles, err := c.rolesToDeleteForRoleRollingUpdate(ctx, ms, sg, needsUpdate)
 		if err != nil {
 			return updateCount, err
 		}
 		if !hasOutdatedRoles {
-			c.updateServingGroupRevisionIfNoOutdatedRoles(ctx, ms, sg.Name, revision)
+			c.updateServingGroupRevisionIfNoOutdatedRoles(ctx, ms, sg.Name, revision, needsUpdate)
 			continue
 		}
 		if len(rolesToDelete) == 0 {
@@ -1552,7 +1564,7 @@ func (c *ModelServingController) deleteOutdatedRoles(
 	return updateCount, nil
 }
 
-func (c *ModelServingController) updateServingGroupRevisionIfNoOutdatedRoles(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName, revision string) {
+func (c *ModelServingController) updateServingGroupRevisionIfNoOutdatedRoles(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName, revision string, needsUpdate roleUpdateCheck) {
 	roles, err := c.store.GetRolesByGroup(utils.GetNamespaceName(ms), groupName)
 	if err != nil {
 		return
@@ -1570,7 +1582,7 @@ func (c *ModelServingController) updateServingGroupRevisionIfNoOutdatedRoles(ctx
 			if !ok {
 				continue
 			}
-			outdated, err := c.roleNeedsUpdate(ctx, ms, datastore.ServingGroup{Name: groupName}, targetRole, *role)
+			outdated, err := needsUpdate(ctx, datastore.ServingGroup{Name: groupName}, targetRole, *role)
 			if err != nil {
 				klog.Errorf("failed to compare role revision %s: %v", role.Revision, err)
 				return
@@ -1592,7 +1604,7 @@ type roleToDelete struct {
 	roleID   string
 }
 
-func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ctx context.Context, ms *workloadv1alpha1.ModelServing, sg datastore.ServingGroup) ([]roleToDelete, bool, error) {
+func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ctx context.Context, ms *workloadv1alpha1.ModelServing, sg datastore.ServingGroup, needsUpdate roleUpdateCheck) ([]roleToDelete, bool, error) {
 	roleSpecByName := make(map[string]workloadv1alpha1.Role, len(ms.Spec.Template.Roles))
 	for _, role := range ms.Spec.Template.Roles {
 		roleSpecByName[role.Name] = role
@@ -1611,7 +1623,7 @@ func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ctx context.C
 			return nil, false, fmt.Errorf("failed to get roles for ServingGroup %s, role %s: %v", sg.Name, roleSpec.Name, err)
 		}
 
-		outdatedRoles, newUnavailable, err := c.outdatedRoles(ctx, ms, sg, roleSpec, roleList)
+		outdatedRoles, newUnavailable, err := c.outdatedRoles(ctx, ms, sg, roleSpec, roleList, needsUpdate)
 		if err != nil {
 			return nil, false, fmt.Errorf("failed to compare roles for ServingGroup %s, role %s: %v", sg.Name, roleSpec.Name, err)
 		}
@@ -1670,7 +1682,7 @@ func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ctx context.C
 	return rolesToDelete, hasOutdatedRoles, nil
 }
 
-func (c *ModelServingController) outdatedRoles(ctx context.Context, ms *workloadv1alpha1.ModelServing, sg datastore.ServingGroup, roleSpec workloadv1alpha1.Role, roleList []datastore.Role) ([]datastore.Role, int, error) {
+func (c *ModelServingController) outdatedRoles(ctx context.Context, ms *workloadv1alpha1.ModelServing, sg datastore.ServingGroup, roleSpec workloadv1alpha1.Role, roleList []datastore.Role, needsUpdate roleUpdateCheck) ([]datastore.Role, int, error) {
 	outdatedRoles := make([]datastore.Role, 0, len(roleList))
 	// record the number of roles that is in rollingupdate but not ready yet.
 	newUnavailable := 0
@@ -1679,7 +1691,7 @@ func (c *ModelServingController) outdatedRoles(ctx context.Context, ms *workload
 			newUnavailable++
 			continue
 		}
-		outdated, err := c.roleNeedsUpdate(ctx, ms, sg, roleSpec, role)
+		outdated, err := needsUpdate(ctx, sg, roleSpec, role)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1704,56 +1716,73 @@ func (c *ModelServingController) outdatedRoles(ctx context.Context, ms *workload
 	return outdatedRoles, newUnavailable, nil
 }
 
-// roleNeedsUpdate compares a live Role with the canonical revision inputs that
-// apply to that Role. Legacy revisions are always outdated so the one-time v1
-// migration follows the normal rollout strategy. A Role with a revision identity
-// is conservatively outdated when its history cannot be read. Legacy roles use
-// RoleTemplateHash only when it is available; unknown identity is outdated.
-func (c *ModelServingController) roleNeedsUpdate(
-	ctx context.Context,
-	ms *workloadv1alpha1.ModelServing,
-	sg datastore.ServingGroup,
-	targetRole workloadv1alpha1.Role,
-	role datastore.Role,
-) (bool, error) {
-	expected, err := utils.RoleRevisionHash(ms, targetRole.Name)
-	if err != nil {
-		return false, fmt.Errorf("build desired revision identity for role %s: %w", targetRole.Name, err)
-	}
+// roleUpdateCheck compares a replica with the desired revision inputs for its Role.
+type roleUpdateCheck func(context.Context, datastore.ServingGroup, workloadv1alpha1.Role, datastore.Role) (bool, error)
 
-	revision := role.Revision
-	if revision == "" {
-		revision = sg.Revision
-	}
-	if revision != "" {
-		if c == nil || c.kubeClientSet == nil {
-			return true, nil
-		}
-		cr, err := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revision)
-		if err != nil {
-			return false, fmt.Errorf("get ControllerRevision %s: %w", revision, err)
-		}
-		if cr == nil {
-			// A RoleTemplateHash only describes the Role. It cannot prove that
-			// ModelServing-level revisioned inputs (such as schedulerName or
-			// plugins) still match when the referenced history is gone.
-			return true, nil
-		}
-		if cr.Annotations[utils.ControllerRevisionDataVersionAnnotation] == utils.ControllerRevisionDataVersionV1 {
-			observed, err := utils.RoleRevisionHashFromRevisionData(cr.Data.Raw, targetRole.Name)
+// newRoleUpdateCheck reuses immutable history and comparison results within one
+// reconciliation. It is not shared with informer callbacks or later reconciliations.
+// Legacy or missing history is conservatively outdated; replicas without a
+// revision identity retain the legacy RoleTemplateHash fallback.
+func (c *ModelServingController) newRoleUpdateCheck(ms *workloadv1alpha1.ModelServing) roleUpdateCheck {
+	desiredHashes := make(map[string]string)
+	revisions := make(map[string]*appsv1.ControllerRevision)
+	comparisons := make(map[[2]string]bool)
+	return func(ctx context.Context, sg datastore.ServingGroup, targetRole workloadv1alpha1.Role, role datastore.Role) (bool, error) {
+		expected, ok := desiredHashes[targetRole.Name]
+		if !ok {
+			var err error
+			expected, err = utils.RoleRevisionHash(ms, targetRole.Name)
 			if err != nil {
-				return false, fmt.Errorf("build revision identity for Role %s from ControllerRevision %s: %w", targetRole.Name, cr.Name, err)
+				return false, fmt.Errorf("build desired revision identity for role %s: %w", targetRole.Name, err)
 			}
-			return observed != expected, nil
+			desiredHashes[targetRole.Name] = expected
 		}
-		return true, nil
-	}
 
-	if role.RoleTemplateHash == "" {
-		klog.Warningf("treat legacy role %s/%s in ServingGroup %s as outdated because its identity is missing", targetRole.Name, role.Name, sg.Name)
-		return true, nil
+		revision := role.Revision
+		if revision == "" {
+			revision = sg.Revision
+		}
+		if revision != "" {
+			if c == nil || c.kubeClientSet == nil {
+				return true, nil
+			}
+			key := [2]string{revision, targetRole.Name}
+			if outdated, ok := comparisons[key]; ok {
+				return outdated, nil
+			}
+			cr, ok := revisions[revision]
+			if !ok {
+				var err error
+				cr, err = utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revision)
+				if err != nil {
+					return false, fmt.Errorf("get ControllerRevision %s: %w", revision, err)
+				}
+				revisions[revision] = cr
+			}
+			if cr == nil {
+				// A RoleTemplateHash only describes the Role. It cannot prove that
+				// ModelServing-level revisioned inputs (such as schedulerName or
+				// plugins) still match when the referenced history is gone.
+				return true, nil
+			}
+			if cr.Annotations[utils.ControllerRevisionDataVersionAnnotation] == utils.ControllerRevisionDataVersionV1 {
+				observed, err := utils.RoleRevisionHashFromRevisionData(cr.Data.Raw, targetRole.Name)
+				if err != nil {
+					return false, fmt.Errorf("build revision identity for Role %s from ControllerRevision %s: %w", targetRole.Name, cr.Name, err)
+				}
+				outdated := observed != expected
+				comparisons[key] = outdated
+				return outdated, nil
+			}
+			return true, nil
+		}
+
+		if role.RoleTemplateHash == "" {
+			klog.Warningf("treat legacy role %s/%s in ServingGroup %s as outdated because its identity is missing", targetRole.Name, role.Name, sg.Name)
+			return true, nil
+		}
+		return role.RoleTemplateHash != utils.CalRoleTemplateHash(targetRole), nil
 	}
-	return role.RoleTemplateHash != utils.CalRoleTemplateHash(targetRole), nil
 }
 
 func selectOutdatedRolesToDelete(roleName string, outdatedRoles []datastore.Role, maxScaleDown int) ([]roleToDelete, error) {
@@ -2032,6 +2061,35 @@ func (c *ModelServingController) checkRoleReady(ms *workloadv1alpha1.ModelServin
 	if targetRole == nil {
 		klog.Warningf("role %s not found in ModelServing spec", roleName)
 		return false, nil
+	}
+
+	// Role partitions can leave different Pod layouts within the same group.
+	// Resolve the protected instance exactly as the missing-Pod creation path does.
+	partition, _, err := c.getPartition(rolePartition(ms, *targetRole), roleReplicas(*targetRole))
+	if err != nil {
+		return false, err
+	}
+	if partition > 0 {
+		roleList, err := c.store.GetRoleList(utils.GetNamespaceName(ms), servingGroupName, roleName)
+		if err != nil {
+			return false, err
+		}
+		for index, role := range roleList {
+			if index >= partition {
+				break
+			}
+			if role.Name != roleID {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			resolved, _, _, _, err := c.roleTemplateForReplica(ctx, ms, *targetRole, role, desiredRevision, nil)
+			if err != nil {
+				return false, err
+			}
+			targetRole = &resolved
+			break
+		}
 	}
 
 	// Calculate expected pod count for this role replica
@@ -3205,6 +3263,7 @@ func (c *ModelServingController) modelServingForRevision(
 // findOutdatedRolesInServingGroups finds outdated roles in serving groups and returns a map of serving group names to outdated role names
 // If a serving group has no outdated roles, it updates the serving group's revision in the store
 func (c *ModelServingController) findOutdatedRolesInServingGroups(ms *workloadv1alpha1.ModelServing, servingGroups []datastore.ServingGroup, revision string) map[string][]string {
+	needsUpdate := c.newRoleUpdateCheck(ms)
 	outdatedRolesMap := make(map[string][]string)
 
 	// Create a mapping of role name to the current role specification.
@@ -3233,7 +3292,7 @@ func (c *ModelServingController) findOutdatedRolesInServingGroups(ms *workloadv1
 				if role.Status == datastore.RoleDeleting {
 					continue
 				}
-				outdated, err := c.roleNeedsUpdate(context.Background(), ms, sg, roleSpec, role)
+				outdated, err := needsUpdate(context.Background(), sg, roleSpec, role)
 				if err != nil {
 					klog.Errorf("failed to compare role %s/%s in ServingGroup %s: %v", roleName, role.Name, sg.Name, err)
 					continue
@@ -3267,7 +3326,7 @@ func (c *ModelServingController) findOutdatedRolesInServingGroups(ms *workloadv1
 			// There are outdated roles in this serving group
 			outdatedRolesMap[sg.Name] = outdatedRoleNames
 		} else {
-			c.updateServingGroupRevisionIfNoOutdatedRoles(context.Background(), ms, sg.Name, revision)
+			c.updateServingGroupRevisionIfNoOutdatedRoles(context.Background(), ms, sg.Name, revision, needsUpdate)
 		}
 	}
 
