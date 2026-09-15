@@ -2905,30 +2905,106 @@ func (f *protectedServingGroupFixture) addEntryPod(t *testing.T, roleName, roleI
 }
 
 func TestHistoricalRecoveryReadinessUsesRecoveredWorkload(t *testing.T) {
-	currentRole := workloadv1alpha1.Role{
-		Name: "decode", Replicas: ptr.To[int32](1), WorkerReplicas: 1,
-		EntryTemplate: workloadv1alpha1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "decode", Image: "new-image"}}}},
+	for _, tt := range []struct {
+		name                   string
+		rolePartition          bool
+		oldWorkers, newWorkers int32
+	}{
+		{name: "serving group partition", newWorkers: 1},
+		{name: "role partition increased workers", rolePartition: true, newWorkers: 2},
+		{name: "role partition decreased workers", rolePartition: true, oldWorkers: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			currentRole := workloadv1alpha1.Role{
+				Name: "decode", Replicas: ptr.To[int32](1), WorkerReplicas: tt.newWorkers,
+				EntryTemplate: workloadv1alpha1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "decode", Image: "new-image"}}}},
+			}
+			currentRole.WorkerTemplate = currentRole.EntryTemplate.DeepCopy()
+			historicalRole := *currentRole.DeepCopy()
+			historicalRole.WorkerReplicas = tt.oldWorkers
+			historicalRole.EntryTemplate.Spec.Containers[0].Image = "old-image"
+			historicalRole.WorkerTemplate = historicalRole.EntryTemplate.DeepCopy()
+			f := newProtectedServingGroupFixture(t, "recover-readiness", []workloadv1alpha1.Role{currentRole}, []workloadv1alpha1.Role{historicalRole}, datastore.ServingGroupCreating)
+			if tt.rolePartition {
+				f.modelServing.Spec.RolloutStrategy = &workloadv1alpha1.RolloutStrategy{Type: workloadv1alpha1.RoleRollingUpdate}
+				f.modelServing.Spec.Template.Roles[0].Partition = ptr.To(intstr.FromInt(1))
+			}
+			roleID := f.addRole(t, "decode")
+			if tt.oldWorkers > 0 {
+				// Keep the entry so the current worker count would hide missing historical workers.
+				pod := utils.GenerateEntryPod(historicalRole, f.modelServing, f.groupName, roleID, f.oldRevision, "decode-hash")
+				_, err := f.kubeClient.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+				require.NoError(t, err)
+				require.NoError(t, f.controller.podsInformer.GetIndexer().Add(pod))
+			}
+			require.NoError(t, f.controller.syncRoleReplicas(ctx, f.modelServing, f.newRevision, f.controller.newRoleUpdateCheck(f.modelServing)))
+			pods, err := f.kubeClient.CoreV1().Pods(f.modelServing.Namespace).List(ctx, metav1.ListOptions{})
+			require.NoError(t, err)
+			require.Len(t, pods.Items, 1+int(tt.oldWorkers))
+			for i := range pods.Items {
+				pod := &pods.Items[i]
+				assert.Equal(t, f.oldRevision, utils.ObjectRevision(pod))
+				assert.Equal(t, "old-image", pod.Spec.Containers[0].Image)
+				pod.Status.Phase = corev1.PodRunning
+				pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+				require.NoError(t, f.controller.podsInformer.GetIndexer().Update(pod))
+				require.NoError(t, f.controller.handleReadyPod(f.modelServing, f.groupName, pod))
+			}
+			assert.Equal(t, datastore.RoleRunning, f.controller.store.GetRoleStatus(f.key, f.groupName, "decode", roleID))
+			assert.Equal(t, datastore.ServingGroupRunning, f.controller.store.GetServingGroupStatus(f.key, f.groupName))
+		})
 	}
-	historicalRole := *currentRole.DeepCopy()
-	historicalRole.WorkerReplicas = 0
-	historicalRole.EntryTemplate.Spec.Containers[0].Image = "old-image"
-	f := newProtectedServingGroupFixture(t, "recover-readiness", []workloadv1alpha1.Role{currentRole}, []workloadv1alpha1.Role{historicalRole}, datastore.ServingGroupCreating)
-	roleID := f.addRole(t, "decode")
+}
 
-	require.NoError(t, f.controller.syncRoleReplicas(context.Background(), f.modelServing, f.newRevision, f.controller.newRoleUpdateCheck(f.modelServing)))
-	pods, err := f.kubeClient.CoreV1().Pods(f.modelServing.Namespace).List(context.Background(), metav1.ListOptions{})
+func TestRoleUpdateCheckReusesHistoryWithinReconciliation(t *testing.T) {
+	ctx := context.Background()
+	kubeClient := kubefake.NewSimpleClientset()
+	c := &ModelServingController{kubeClientSet: kubeClient}
+	ms := &workloadv1alpha1.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{Name: "comparison", Namespace: "default", UID: "comparison-uid"},
+		Spec: workloadv1alpha1.ModelServingSpec{Template: workloadv1alpha1.ServingGroup{Roles: []workloadv1alpha1.Role{
+			{Name: "decode", EntryTemplate: workloadv1alpha1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "model", Image: "old"}}}}},
+			{Name: "prefill", EntryTemplate: workloadv1alpha1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "model", Image: "old"}}}}},
+		}}},
+	}
+	data, err := utils.BuildRevisionData(ms)
 	require.NoError(t, err)
-	require.Len(t, pods.Items, 1)
-	assert.Equal(t, f.oldRevision, pods.Items[0].Labels[workloadv1alpha1.RevisionLabelKey])
-	assert.Equal(t, "old-image", pods.Items[0].Spec.Containers[0].Image)
+	history, _, err := utils.RecordModelServingRevision(ctx, kubeClient, ms, data)
+	require.NoError(t, err)
+	oldRevision := history.Labels[utils.ControllerRevisionRevisionLabelKey]
+	ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "new"
+	data, err = utils.BuildRevisionData(ms)
+	require.NoError(t, err)
+	history, _, err = utils.RecordModelServingRevision(ctx, kubeClient, ms, data)
+	require.NoError(t, err)
+	newRevision := history.Labels[utils.ControllerRevisionRevisionLabelKey]
+	kubeClient.ClearActions()
 
-	readyPod := pods.Items[0].DeepCopy()
-	readyPod.Status.Phase = corev1.PodRunning
-	readyPod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
-	require.NoError(t, f.controller.podsInformer.GetIndexer().Add(readyPod))
-	require.NoError(t, f.controller.handleReadyPod(f.modelServing, f.groupName, readyPod))
-	assert.Equal(t, datastore.RoleRunning, f.controller.store.GetRoleStatus(f.key, f.groupName, "decode", roleID))
-	assert.Equal(t, datastore.ServingGroupRunning, f.controller.store.GetServingGroupStatus(f.key, f.groupName))
+	needsUpdate := c.newRoleUpdateCheck(ms)
+	for _, revision := range []string{oldRevision, newRevision} {
+		for _, role := range ms.Spec.Template.Roles {
+			for i := 0; i < 10; i++ {
+				outdated, err := needsUpdate(ctx, datastore.ServingGroup{}, role, datastore.Role{
+					Name: utils.GenerateRoleID(role.Name, i), Revision: revision,
+				})
+				require.NoError(t, err)
+				assert.Equal(t, revision == oldRevision && role.Name == "decode", outdated)
+			}
+		}
+	}
+	// Multiple Roles and replicas share one GET per historical revision.
+	require.Len(t, kubeClient.Actions(), 2)
+	for _, action := range kubeClient.Actions() {
+		assert.True(t, action.Matches("get", "controllerrevisions"))
+	}
+
+	// A later reconciliation must see spec changes instead of reusing old results.
+	ms.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = "old"
+	outdated, err := c.newRoleUpdateCheck(ms)(ctx, datastore.ServingGroup{}, ms.Spec.Template.Roles[0], datastore.Role{Revision: oldRevision})
+	require.NoError(t, err)
+	assert.False(t, outdated)
+	require.Len(t, kubeClient.Actions(), 3)
 }
 
 func TestProtectedHistoricalServingGroupRoleMembership(t *testing.T) {
